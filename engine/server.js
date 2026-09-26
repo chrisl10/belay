@@ -271,7 +271,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, false); return; }
       try {
         const j = JSON.parse(payload);
         const d = (j.choices || [{}])[0].delta || {};
@@ -292,12 +292,13 @@ function pipeGrokSSE(upRes, res, model, tag) {
             if (s.textIdx >= 0) s.closeBlock(s.textIdx);
             closeThink();
             const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
-            bIdx = s.openBlock({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_sse_" + key), name: (typeof fn.name === "string" && fn.name) || "" });
+            bIdx = s.openBlock({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_sse_" + key), name: (typeof fn.name === "string" && fn.name) || "", input: {} });
             (s.toolIdx || (s.toolIdx = new Map())).set(key, bIdx);
+            (s.toolArgs || (s.toolArgs = new Map())).set(key, "");
             toolEmitted = true;
           }
           const args = (tc.function && typeof tc.function.arguments === "string") ? tc.function.arguments : "";
-          if (args) { usage.output_tokens++; sseWrite(res, "content_block_delta", { type: "content_block_delta", index: bIdx, delta: { type: "input_json_delta", partial_json: args } }); }
+          if (args) { usage.output_tokens++; (s.toolArgs || (s.toolArgs = new Map())).set(key, (s.toolArgs.get(key) || "") + args); sseWrite(res, "content_block_delta", { type: "content_block_delta", index: bIdx, delta: { type: "input_json_delta", partial_json: args } }); }
         }
         if (j.usage && j.usage.completion_tokens) usage.output_tokens = j.usage.completion_tokens;
       } catch {}
@@ -305,12 +306,31 @@ function pipeGrokSSE(upRes, res, model, tag) {
   });
   let finish = "";
   let toolEmitted = false;
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
 // surface as thinking blocks (route tag rides first) instead of being dropped.
+
+// PRD-005: shared stream finisher. A tool_use block whose arguments JSON is
+// truncated (provider cut the stream mid-call, or token limit) would poison the
+// client - Claude Code parses arguments and dies with a malformed-stream error.
+// In that case emit an SSE error event so the client retries the turn cleanly.
+function finishStream(res, usage, finish, s, toolEmitted, abnormal) {
+  const tools = s.toolArgs || new Map();
+  for (const [, args] of tools) {
+    if (typeof args === "string" && args.trim()) {
+      try { JSON.parse(args); }
+      catch {
+        sseWrite(res, "error", { type: "error", error: { type: "api_error", message: "upstream ended mid tool call (arguments truncated); retry the turn" } });
+        res.end();
+        return;
+      }
+    }
+  }
+  anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage);
+}
 function pipeGPTSSE(upRes, res, model, tag) {
   const s = openAnthropicStream(res, model, tag, true);
   let buf = "", usage = { output_tokens: 0 };
@@ -325,7 +345,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, false); return; }
       try {
         const j = JSON.parse(payload);
         const t = j.type || "";
@@ -338,8 +358,9 @@ function pipeGPTSSE(upRes, res, model, tag) {
         if (t === "response.output_item.added" && (j.item || {}).type === "function_call") { // PRD-005: gpt-lane streaming tool calls
           closeThink();
           const it = j.item;
-          const fi = s.openBlock({ type: "tool_use", id: (typeof it.call_id === "string" && it.call_id) || ("toolu_sse_" + (s.fnCount = (s.fnCount || 0) + 1)), name: (typeof it.name === "string" && it.name) || "" });
+          const fi = s.openBlock({ type: "tool_use", id: (typeof it.call_id === "string" && it.call_id) || ("toolu_sse_" + (s.fnCount = (s.fnCount || 0) + 1)), name: (typeof it.name === "string" && it.name) || "", input: {} });
           (s.fnIdx || (s.fnIdx = new Map())).set(it.id || it.call_id, fi);
+          (s.fnArgs || (s.fnArgs = new Map())).set(fi, "");
           toolEmitted = true;
         }
         if (t === "response.function_call_arguments.delta" && typeof j.delta === "string" && j.delta) {
@@ -356,12 +377,12 @@ function pipeGPTSSE(upRes, res, model, tag) {
           anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { output_tokens: u.output_tokens || usage.output_tokens });
           return;
         }
-        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
+        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); return; }
       } catch {}
     }
   });
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); } });
 }
 
 // ---------- PRD-001b B-6: anthropic SSE -> openai chat SSE (inverse of pipeGrokSSE) ----------
