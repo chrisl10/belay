@@ -1,0 +1,45 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: engine syntax
+        run: node --check engine/server.js
+      - name: shell syntax
+        run: |
+          for f in $(find . -name "*.sh" -not -path "./node_modules/*"); do bash -n "$f"; done
+      - name: example config is valid JSON and schema-shaped
+        run: |
+          python3 - <<'EOF'
+          import json
+          c = json.load(open("belay.config.example.json"))
+          assert c["candidates"] and isinstance(c["candidates"], dict)
+          for n, cd in c["candidates"].items():
+              assert cd.get("lane") in ("gpt", "grok", "litellm"), n
+          for n, ch in c.get("chains", {}).items():
+              assert n in c["candidates"], n
+              for h in ch:
+                  assert h == "@openrouter" or h in c["candidates"], h
+          print("example config OK")
+          EOF
+      - name: no personal infrastructure (the no-bleed guard)
+        run: |
+          if grep -rniE "100\.117\.|macdev|chris\.lyle|fabric-fleet|z\.ai/api|chrisl10/fabric-fleet" \
+             --include="*.js" --include="*.json" --include="*.md" --include="*.yml" \
+             --exclude-dir=node_modules . ; then
+            echo "::error::personal infrastructure references found"; exit 1
+          fi
+          echo "no-bleed guard OK"
+      - name: no secrets committed
+        run: |
+          if grep -rniE "sk-[a-z0-9]{20}|ghp_[a-z0-9]{30}|Bearer [A-Za-z0-9_-]{30,}" \
+             --include="*.js" --include="*.json" --include="*.md" \
+             --exclude-dir=node_modules . ; then
+            echo "::error::possible secret found"; exit 1
+          fi
+          echo "secret scan OK"

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "port": 4000,
+  "tailnetIp": "",
+  "litellm": { "host": "127.0.0.1", "port": 4001 },
+  "openrouterFallbacks": ["or-cheap-flash", "or-cheap-chat"],
+  "candidates": {
+    "big":  { "class": "frontier",  "mods": ["text"], "lane": "litellm", "glyph": "🚀", "tag": "big" },
+    "fast": { "class": "fast",      "mods": ["text"], "lane": "litellm", "glyph": "⚡", "tag": "fast" }
+  },
+  "chains": {
+    "big":  ["fast", "@openrouter"],
+    "fast": ["big", "@openrouter"]
+  },
+  "images": {
+    "default": "grok-imagine-image-2.0",
+    "bestAlias": ["best", ""],
+    "grokPrefix": "grok-"
+  },
+  "auto": {
+    "question": "Which model should handle this coding task? Pick the cheapest model that is clearly sufficient; frontier models only for hard work.",
+    "maxTaskChars": 2000
+  },
+  "routeTag": { "enabled": true },
+  "requiredKeys": []
+}

@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="belay: one endpoint, every subscription, zero wasted tokens">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="rope" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#a3e635"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#34d399" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#34d399" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <!-- subtle route grid -->
+  <g stroke="#1c2740" stroke-width="1">
+    <path d="M0 105 H1200 M0 210 H1200 M0 315 H1200 M0 420 H1200 M0 525 H1200"/>
+    <path d="M150 0 V630 M300 0 V630 M450 0 V630 M600 0 V630 M750 0 V630 M900 0 V630 M1050 0 V630"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="ui-monospace,Menlo,Consolas,monospace">
+    <text x="64" y="118" fill="#e6edf3" font-size="64" font-weight="700" letter-spacing="2">belay</text>
+    <text x="64" y="152" fill="#8b949e" font-size="20">the subscription ladder for AI coding agents</text>
+  </g>
+  <!-- rope underline -->
+  <rect x="64" y="168" width="300" height="4" rx="2" fill="url(#rope)"/>
+  <circle cx="372" cy="170" r="7" fill="none" stroke="#34d399" stroke-width="3"/>
+
+  <!-- headline -->
+  <g font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+    <text x="64" y="248" fill="#e6edf3" font-size="44" font-weight="800">One endpoint.</text>
+    <text x="64" y="302" fill="#34d399" font-size="44" font-weight="800">Every subscription.</text>
+    <text x="64" y="356" fill="#e6edf3" font-size="44" font-weight="800">Zero wasted tokens.</text>
+    <text x="64" y="404" fill="#8b949e" font-size="19">An AI in the middle picks the cheapest model that is clearly sufficient -</text>
+    <text x="64" y="430" fill="#8b949e" font-size="19">and when a provider hits its limit mid-task, the ladder catches you.</text>
+  </g>
+
+  <!-- harness chips -->
+  <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="15">
+    <rect x="64" y="470" width="132" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+    <text x="130" y="495" fill="#e6edf3" text-anchor="middle">Claude Code</text>
+    <rect x="210" y="470" width="82" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+    <text x="251" y="495" fill="#e6edf3" text-anchor="middle">Codex</text>
+    <rect x="306" y="470" width="70" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+    <text x="341" y="495" fill="#e6edf3" text-anchor="middle">ZCode</text>
+    <rect x="390" y="470" width="52" height="40" rx="20" fill="#161b22" stroke="#30363d"/>
+    <text x="416" y="495" fill="#8b949e" text-anchor="middle">+you</text>
+  </g>
+
+  <!-- the ladder panel -->
+  <g>
+    <rect x="640" y="86" width="500" height="452" rx="14" fill="#0a0e16" stroke="#30363d"/>
+    <rect x="640" y="86" width="500" height="452" rx="14" fill="url(#glow)"/>
+    <text x="668" y="126" fill="#8b949e" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="15">the ladder (hop 1 = subscriptions you already pay for)</text>
+
+    <!-- hop 1 rows: hit by jev / walked on 429 -->
+    <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="16">
+      <rect x="668" y="146" width="444" height="40" rx="8" fill="#12261e" stroke="#34d399"/>
+      <text x="684" y="171" fill="#34d399">1  jev picks</text>
+      <text x="1096" y="171" fill="#8b949e" text-anchor="end">best model for THIS task</text>
+
+      <rect x="668" y="196" width="444" height="40" rx="8" fill="#161b22" stroke="#30363d"/>
+      <text x="684" y="221" fill="#e6edf3">2  gpt-6-astra</text>
+      <text x="1096" y="221" fill="#6e7681" text-anchor="end">429? walk</text>
+
+      <rect x="668" y="246" width="444" height="40" rx="8" fill="#161b22" stroke="#30363d"/>
+      <text x="684" y="271" fill="#e6edf3">3  grok-4.7</text>
+      <text x="1096" y="271" fill="#6e7681" text-anchor="end">429? walk</text>
+
+      <rect x="668" y="296" width="444" height="40" rx="8" fill="#161b22" stroke="#30363d"/>
+      <text x="684" y="321" fill="#e6edf3">4  glm-5.3</text>
+      <text x="1096" y="321" fill="#6e7681" text-anchor="end">429? walk</text>
+    </g>
+
+    <!-- rope connecting hop1 rows -->
+    <line x1="690" y1="196" x2="690" y2="336" stroke="url(#rope)" stroke-width="3"/>
+
+    <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="16">
+      <rect x="668" y="366" width="444" height="40" rx="8" fill="#241a10" stroke="#f59e0b"/>
+      <text x="684" y="391" fill="#f59e0b">5  pay-as-you-go</text>
+      <text x="1096" y="391" fill="#8b949e" text-anchor="end">only when free runs dry</text>
+    </g>
+
+    <!-- session-never-dies footer chip -->
+    <rect x="668" y="436" width="444" height="76" rx="8" fill="#111827" stroke="#30363d"/>
+    <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="15">
+      <text x="684" y="466" fill="#34d399">[ladder] gpt-6-astra failed: 429</text>
+      <text x="684" y="492" fill="#e6edf3">[ladder] gpt-6-astra -&gt; served by grok-4.7</text>
+    </g>
+  </g>
+
+  <!-- footer strip -->
+  <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="16">
+    <text x="64" y="560" fill="#58a6ff">anthropic-in</text>
+    <circle cx="196" cy="555" r="3" fill="#30363d"/>
+    <text x="216" y="560" fill="#a371f7">openai-chat-in</text>
+    <circle cx="366" cy="555" r="3" fill="#30363d"/>
+    <text x="386" y="560" fill="#f59e0b">responses-in</text>
+    <circle cx="524" cy="555" r="3" fill="#30363d"/>
+    <text x="544" y="560" fill="#8b949e">one Node file - config in git - MIT</text>
+  </g>
+  <text x="64" y="596" fill="#484f58" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="14">routing decision cost: ~$0.00001  -  tokens saved: 10-100x on routine tasks</text>
+</svg>

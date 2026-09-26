@@ -1,0 +1,10 @@
+{
+  "name": "belay-engine",
+  "version": "0.1.0",
+  "description": "belay engine - one endpoint for every AI subscription",
+  "main": "server.js",
+  "license": "MIT",
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  }
+}
