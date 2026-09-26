@@ -1264,6 +1264,13 @@ function handleRequest(req, res) {
     req.resume();
     return;
   }
+  if (req.method === "GET" && req.url.startsWith("/v1/health")) {
+    let lastCapture = 0, captureCount = 0;
+    try { const cs = fs.readdirSync(CAPTURE_DIR).filter((x) => x.endsWith(".sse")); captureCount = cs.length; for (const c of cs) { const m = c.match(/stream-(\d+)-/); if (m) lastCapture = Math.max(lastCapture, Number(m[1])); } } catch {}
+    const restartsToday = (() => { try { const log = fs.readFileSync(path.join(path.dirname(USAGE_PATH), "..", "Logs", "fabric-router.log"), "utf8"); return (log.match(/fabric-router v3/g) || []).length; } catch { return -1; } })();
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, pid: process.pid, uptimeSec: Math.floor(process.uptime()), emptyWalks: USAGE.events.filter((e) => String(e.text).includes("empty stream")).length, captureCount, lastCapture, note: "watch /v1/usage events + ~/belay/captures when streams misbehave" }));
+  }
   if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), models: USAGE.models, events: USAGE.events.slice(0, 30) }));
