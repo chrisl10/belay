@@ -227,24 +227,31 @@ function sseWrite(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.s
 // Open a message; optionally lead with a tag-only thinking block (route visibility),
 // then the text block. Returns block-index helpers for multi-block streams.
 function openAnthropicStream(res, model, tag, tagAlways) {
-  if (res.headersSent) throw new Error("client stream already started; refusing to restart");
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-  sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  let tagEmitted = false;
   let next = 0;
   const open = [];
   const openBlock = (cb) => { const i = next++; open.push(i); sseWrite(res, "content_block_start", { type: "content_block_start", index: i, content_block: cb }); return i; };
   const closeBlock = (i) => { sseWrite(res, "content_block_stop", { type: "content_block_stop", index: i }); const k = open.indexOf(i); if (k >= 0) open.splice(k, 1); };
-  let tagEmitted = false;
-  if (tag && tagAlways) {
-    const i = openBlock({ type: "thinking", thinking: "" });
-    sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: tag + "\n" } });
-    sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: "sig_router" } });
-    closeBlock(i);
-    tagEmitted = true;
-  }
-  // PRD-005 fix: the text block opens LAZILY on the first text delta - an empty
-  // text block (start+stop, no deltas) reads as a malformed stream to clients.
-  return { textIdx: -1, tagEmitted, openBlock, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
+  // LAZY PRIMING: nothing reaches the client until the first real content block.
+  // If the upstream streams nothing (empty 200s under quota pressure), zero
+  // client bytes have flowed and the ladder can still walk to another hop.
+  let primed = false;
+  const prime = () => {
+    if (primed) return;
+    primed = true;
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+    if (tag && tagAlways) {
+      const i = openBlock({ type: "thinking", thinking: "" });
+      sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: tag + "\n" } });
+      sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: "sig_router" } });
+      closeBlock(i);
+      tagEmitted = true;
+    }
+  };
+  // text block opens lazily on the first text delta - an empty text block
+  // (start+stop, no deltas) reads as a malformed stream to clients.
+  return { textIdx: -1, tagEmitted, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
 }
 function anthropicStreamEnd(res, stopReason, usage) {
   sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { output_tokens: (usage && usage.output_tokens) || 0 } });
@@ -259,7 +266,7 @@ const captureOn = process.env.BELAY_CAPTURE !== "0";
 // grok/openai-chat: openai chat SSE -> anthropic SSE. Maps streaming tool_calls
 // deltas to tool_use blocks and reasoning_content to thinking blocks (PRD-003/004);
 // leads with the route tag so the user sees who served, in-stream.
-function pipeGrokSSE(upRes, res, model, tag) {
+function pipeGrokSSE(upRes, res, model, tag, onEmpty) {
   const s = openAnthropicStream(res, model, tag, true);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
@@ -276,7 +283,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, false); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, false, onEmpty); return; }
       try {
         const j = JSON.parse(payload);
         const d = (j.choices || [{}])[0].delta || {};
@@ -294,7 +301,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
           const key = typeof tc.index === "number" ? tc.index : -1;
           let bIdx = s.toolIdx && s.toolIdx.get(key);
           if (bIdx === undefined) {
-            if (s.textIdx >= 0) s.closeBlock(s.textIdx);
+            if (s.textIdx >= 0) { s.closeBlock(s.textIdx); s.textIdx = -1; } // reset: re-closing a closed block = malformed stream
             closeThink();
             const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
             bIdx = s.openBlock({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_sse_" + key), name: (typeof fn.name === "string" && fn.name) || "", input: {} });
@@ -311,8 +318,8 @@ function pipeGrokSSE(upRes, res, model, tag) {
   });
   let finish = "";
   let toolEmitted = false;
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
@@ -322,7 +329,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
 // truncated (provider cut the stream mid-call, or token limit) would poison the
 // client - Claude Code parses arguments and dies with a malformed-stream error.
 // In that case emit an SSE error event so the client retries the turn cleanly.
-function finishStream(res, usage, finish, s, toolEmitted, abnormal) {
+function finishStream(res, usage, finish, s, toolEmitted, abnormal, onEmpty) {
   const tools = s.toolArgs || new Map();
   for (const [, args] of tools) {
     if (typeof args === "string" && args.trim()) {
@@ -334,9 +341,13 @@ function finishStream(res, usage, finish, s, toolEmitted, abnormal) {
       }
     }
   }
+  if (typeof s.primed === "function" && !s.primed()) { // empty upstream: zero client bytes flowed
+    if (onEmpty) { onEmpty(); return; }
+    return;
+  }
   anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage);
 }
-function pipeGPTSSE(upRes, res, model, tag) {
+function pipeGPTSSE(upRes, res, model, tag, onEmpty) {
   const s = openAnthropicStream(res, model, tag, true);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
@@ -350,7 +361,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, false); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, false, onEmpty); return; }
       try {
         const j = JSON.parse(payload);
         const t = j.type || "";
@@ -361,6 +372,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
         }
         if (t === "response.output_text.delta" && j.delta) { closeThink(); if (s.textIdx < 0) s.textIdx = s.openBlock({ type: "text", text: "" }); usage.output_tokens++; sseWrite(res, "content_block_delta", { type: "content_block_delta", index: s.textIdx, delta: { type: "text_delta", text: j.delta } }); }
         if (t === "response.output_item.added" && (j.item || {}).type === "function_call") { // PRD-005: gpt-lane streaming tool calls
+          if (s.textIdx >= 0) { s.closeBlock(s.textIdx); s.textIdx = -1; }
           closeThink();
           const it = j.item;
           const fi = s.openBlock({ type: "tool_use", id: (typeof it.call_id === "string" && it.call_id) || ("toolu_sse_" + (s.fnCount = (s.fnCount || 0) + 1)), name: (typeof it.name === "string" && it.name) || "", input: {} });
@@ -382,11 +394,11 @@ function pipeGPTSSE(upRes, res, model, tag) {
           anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { output_tokens: u.output_tokens || usage.output_tokens });
           return;
         }
-        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); return; }
+        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); return; }
       } catch {}
     }
   });
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); } });
   upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); sseWrite(res, "error", { type: "error", error: { type: "api_error", message: "upstream connection failed mid stream; retry the turn" } }); res.end(); } });
 }
 
@@ -402,10 +414,10 @@ function pipeAnthropicToOpenAIChatSSE(upRes, res, model, reqModel) {
     if (usage) j.usage = usage;
     return "data: " + JSON.stringify(j) + "\n\n";
   };
-  const writeChunk = (choices, usage) => { if (!res.writableEnded) res.write(chunkStr(choices, usage)); };
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-  // role-only first chunk, as openai clients expect
-  writeChunk([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }]);
+  let primed = false;
+  const prime = () => { if (primed) return; primed = true; res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }); res.write(chunkStr([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }])); };
+  const writeChunk = (choices, usage) => { if (!res.writableEnded) { prime(); res.write(chunkStr(choices, usage)); } };
+  // role-only first chunk, deferred until the first real upstream event (empty streams stay walkable)
   let buf = "";
   let finishReason = null;
   let ended = false;
@@ -416,6 +428,7 @@ function pipeAnthropicToOpenAIChatSSE(upRes, res, model, reqModel) {
     if (ended) return;
     ended = true;
     if (res.writableEnded) return;
+    if (!primed) return; // empty upstream stream: zero client bytes, ladder stays walkable
     usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
     res.write(chunkStr([{ index: 0, delta: {}, finish_reason: finishReason || "stop" }], usage));
     res.write("data: [DONE]\n\n");
@@ -783,8 +796,8 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
     if (status === "incomplete") r.incomplete_details = { reason: "max_output_tokens" };
     return r;
   };
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-  sseWrite(res, "response.created", { type: "response.created", response: responseObj("in_progress") });
+  let primed = false;
+  const prime = () => { if (primed) return; primed = true; res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }); sseWrite(res, "response.created", { type: "response.created", response: responseObj("in_progress") }); };
   let buf = "";
   let ended = false;
   let outIdx = -1, openKind = "", openItem = null, thinkText = "", toolArgs = "";
@@ -796,6 +809,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
       else openItem.status = "completed";
       if (openKind === "tool") openItem.arguments = toolArgs;
       doneItems.push(openItem);
+      prime();
       sseWrite(res, "response.output_item.done", { type: "response.output_item.done", output_index: outIdx, item: openItem });
     }
     outIdx = -1; openKind = ""; openItem = null; thinkText = ""; toolArgs = "";
@@ -805,6 +819,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
     ended = true;
     closeItem();
     if (res.writableEnded) return;
+    if (!primed) return; // empty upstream stream: zero client bytes, ladder stays walkable
     const incomplete = stopReason === "max_tokens";
     const t = incomplete ? "response.incomplete" : "response.completed";
     const u = { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, total_tokens: usage.input_tokens + usage.output_tokens };
@@ -841,17 +856,20 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
           openKind = "text";
           openItem = { type: "message", id: "msg_" + rid + "_" + outIdx, role: "assistant", status: "in_progress", content: [{ type: "output_text", text: "", annotations: [] }] };
         }
+        prime();
         sseWrite(res, "response.output_item.added", { type: "response.output_item.added", output_index: outIdx, item: clone(openItem) });
       } else if (t === "content_block_delta") {
         const d = j.delta || {};
         if (d.type === "text_delta" && typeof d.text === "string" && d.text && openKind === "text" && openItem) {
           usage.output_tokens++;
           openItem.content[0].text += d.text;
+          prime();
           sseWrite(res, "response.output_text.delta", { type: "response.output_text.delta", item_id: openItem.id, output_index: outIdx, content_index: 0, delta: d.text });
         } else if (d.type === "thinking_delta" && typeof d.thinking === "string" && d.thinking && openKind === "thinking") {
           thinkText += d.thinking; // assembled into the reasoning summary at output_item.done (C-3)
         } else if (d.type === "input_json_delta" && typeof d.partial_json === "string" && d.partial_json && openKind === "tool" && openItem) {
           toolArgs += d.partial_json;
+          prime();
           sseWrite(res, "response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: openItem.id, output_index: outIdx, delta: d.partial_json });
         }
       } else if (t === "content_block_stop") {
@@ -944,21 +962,28 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   const ob = anthropicToOpenAI(body); // maps tools + tool history (PRD-001c)
   ob.model = model;
   ob.stream = !!wantStream;
+  ob.reasoning_effort = (cfg.litellm && cfg.litellm.reasoningEffort) || "low"; // z.ai coding models think unboundedly without it
+  ob.allowed_openai_params = ["reasoning_effort"]; // without this LiteLLM rejects the request outright (UnsupportedParamsError -> empty stream)
   return new Promise((resolve, reject) => {
     const b = Buffer.from(JSON.stringify(ob));
     const up = http.request({ host: LITELLM.host, port: LITELLM.port, method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json", "authorization": typeof req.headers.authorization === "string" ? req.headers.authorization : "", "content-length": Buffer.byteLength(b) } }, (ur) => {
       if (isFail(ur.statusCode)) { ur.resume(); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm ${ur.statusCode}`); reject(new Error("litellm " + ur.statusCode)); return; }
       if (wantStream) {
-        if (opts) opts.streamed = true; // client bytes flowing: the ladder must not walk past this point
+        let empty = false;
+        const onEmpty = () => { empty = true; };
         if (dialect) { // openai-chat SSE -> anthropic SSE (sink) -> client dialect SSE
           const sink = anthropicSink();
-          pipeGrokSSE(ur, sink, model, tag);
+          pipeGrokSSE(ur, sink, model, tag, onEmpty);
           (dialect === "responses" ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
         } else {
-          pipeGrokSSE(ur, res, model, tag); // anthropic client: openai-chat SSE -> anthropic SSE directly
+          pipeGrokSSE(ur, res, model, tag, onEmpty); // anthropic client: openai-chat SSE -> anthropic SSE directly
         }
-        meter(model, "ok");
-        ur.on("end", resolve);
+        ur.on("end", () => {
+          if (empty) { meter(model, "fail"); meterEvent(`[ladder] ${model} failed: empty stream`); reject(new Error("litellm empty stream")); return; }
+          if (opts) opts.streamed = true; // real content flowed: the ladder must not walk past this point
+          meter(model, "ok");
+          resolve();
+        });
         return;
       }
       const chunks = [];
