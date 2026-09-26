@@ -241,8 +241,9 @@ function openAnthropicStream(res, model, tag, tagAlways) {
     closeBlock(i);
     tagEmitted = true;
   }
-  const textIdx = openBlock({ type: "text", text: "" });
-  return { textIdx, tagEmitted, openBlock, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
+  // PRD-005 fix: the text block opens LAZILY on the first text delta - an empty
+  // text block (start+stop, no deltas) reads as a malformed stream to clients.
+  return { textIdx: -1, tagEmitted, openBlock, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
 }
 function anthropicStreamEnd(res, stopReason, usage) {
   sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { output_tokens: (usage && usage.output_tokens) || 0 } });
@@ -270,10 +271,12 @@ function pipeGrokSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); return; }
       try {
         const j = JSON.parse(payload);
         const d = (j.choices || [{}])[0].delta || {};
+        const fr = (j.choices || [{}])[0].finish_reason;
+        if (typeof fr === "string" && fr) finish = fr;
         const rc = (typeof d.reasoning_content === "string" && d.reasoning_content) || (d.reasoning && typeof d.reasoning.content === "string" && d.reasoning.content);
         if (rc) { // PRD-004: reasoning deltas -> thinking block, tag rides first
           openThink();
@@ -291,6 +294,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
             const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
             bIdx = s.openBlock({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_sse_" + key), name: (typeof fn.name === "string" && fn.name) || "" });
             (s.toolIdx || (s.toolIdx = new Map())).set(key, bIdx);
+            toolEmitted = true;
           }
           const args = (tc.function && typeof tc.function.arguments === "string") ? tc.function.arguments : "";
           if (args) { usage.output_tokens++; sseWrite(res, "content_block_delta", { type: "content_block_delta", index: bIdx, delta: { type: "input_json_delta", partial_json: args } }); }
@@ -299,8 +303,10 @@ function pipeGrokSSE(upRes, res, model, tag) {
       } catch {}
     }
   });
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
+  let finish = "";
+  let toolEmitted = false;
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
@@ -309,6 +315,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
   const s = openAnthropicStream(res, model, tag, true);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
+  let toolEmitted = false;
   const closeThink = () => { if (thinkIdx >= 0) { sseWrite(res, "content_block_delta", { type: "content_block_delta", index: thinkIdx, delta: { type: "signature_delta", signature: "sig_router" } }); s.closeBlock(thinkIdx); thinkIdx = -1; } };
   upRes.on("data", (chunk) => {
     buf += chunk.toString("utf8");
@@ -328,10 +335,25 @@ function pipeGPTSSE(upRes, res, model, tag) {
           sseWrite(res, "content_block_delta", { type: "content_block_delta", index: thinkIdx, delta: { type: "thinking_delta", thinking: j.delta } });
         }
         if (t === "response.output_text.delta" && j.delta) { closeThink(); if (s.textIdx < 0) s.textIdx = s.openBlock({ type: "text", text: "" }); usage.output_tokens++; sseWrite(res, "content_block_delta", { type: "content_block_delta", index: s.textIdx, delta: { type: "text_delta", text: j.delta } }); }
+        if (t === "response.output_item.added" && (j.item || {}).type === "function_call") { // PRD-005: gpt-lane streaming tool calls
+          closeThink();
+          const it = j.item;
+          const fi = s.openBlock({ type: "tool_use", id: (typeof it.call_id === "string" && it.call_id) || ("toolu_sse_" + (s.fnCount = (s.fnCount || 0) + 1)), name: (typeof it.name === "string" && it.name) || "" });
+          (s.fnIdx || (s.fnIdx = new Map())).set(it.id || it.call_id, fi);
+          toolEmitted = true;
+        }
+        if (t === "response.function_call_arguments.delta" && typeof j.delta === "string" && j.delta) {
+          const fi = s.fnIdx && s.fnIdx.get(j.item_id);
+          if (fi !== undefined) { usage.output_tokens++; sseWrite(res, "content_block_delta", { type: "content_block_delta", index: fi, delta: { type: "input_json_delta", partial_json: j.delta } }); }
+        }
+        if (t === "response.output_item.done" && (j.item || {}).type === "function_call") {
+          const fi = s.fnIdx && s.fnIdx.get(j.item.id || j.item.call_id);
+          if (fi !== undefined) s.closeBlock(fi);
+        }
         if (t === "response.completed" || t === "response.incomplete") {
           const u = (j.response || {}).usage || {};
           closeThink(); s.closeAll();
-          anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : "end_turn", { output_tokens: u.output_tokens || usage.output_tokens });
+          anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { output_tokens: u.output_tokens || usage.output_tokens });
           return;
         }
         if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
