@@ -471,6 +471,15 @@ function pipeAnthropicToOpenAIChatSSE(upRes, res, model, reqModel) {
         if (j.delta && typeof j.delta.stop_reason === "string" && j.delta.stop_reason) finishReason = STOP_TO_FINISH[j.delta.stop_reason] || "stop";
         const u = j.usage || {};
         if (typeof u.output_tokens === "number") usage.completion_tokens = u.output_tokens;
+      } else if (t === "error") { // upstream failed mid-stream: surface in-dialect, never silently
+        prime();
+        if (!res.writableEnded) {
+          res.write('data: {"error":{"message":"' + String((j.error || {}).message || "upstream stream error").replace(/"/g, "'").slice(0, 160) + '","type":"api_error"}}\n\n');
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+        ended = true;
+        return;
       } else if (t === "message_stop") {
         done();
         return;
@@ -878,6 +887,16 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
         if (j.delta && typeof j.delta.stop_reason === "string" && j.delta.stop_reason) stopReason = j.delta.stop_reason;
         const u = j.usage || {};
         if (typeof u.output_tokens === "number") usage.output_tokens = u.output_tokens;
+      } else if (t === "error") { // upstream failed mid-stream: surface as response.failed
+        prime();
+        if (!res.writableEnded) {
+          const fail = responseObj("failed");
+          fail.error = { code: "upstream_error", message: String((j.error || {}).message || "upstream stream error").slice(0, 160) };
+          sseWrite(res, "response.failed", { type: "response.failed", response: fail });
+          res.end();
+        }
+        ended = true;
+        return;
       } else if (t === "message_stop") {
         terminal();
         return;
