@@ -56,6 +56,22 @@ function refreshConfig() { try { if (fs.statSync(CONFIG_PATH).mtimeMs !== cfgMti
 loadConfig();
 if (!cfg) { console.error("[config] no valid config at " + CONFIG_PATH + " - refusing to start"); process.exit(1); }
 
+// ---------- PRD-005: usage metering + dashboard ----------
+// Per-lane-attempt counters, persisted under the data dir; /v1/usage and the
+// dashboard read this. Streams count requests/outcomes; non-stream counts tokens.
+const DATA_DIR = process.env.BELAY_DATA || process.env.FABRIC_DATA || path.join(H, "belay");
+const USAGE_PATH = path.join(DATA_DIR, "usage.json");
+const USAGE = { startedAt: Date.now(), models: {}, events: [] };
+try { const d = JSON.parse(fs.readFileSync(USAGE_PATH, "utf8")); USAGE.models = d.models || {}; USAGE.events = (d.events || []).slice(0, 50); } catch {}
+function meter(model, outcome, tokens) {
+  const m = USAGE.models[model] || (USAGE.models[model] = { requests: 0, ok: 0, failed: 0, tokensIn: 0, tokensOut: 0, lastServed: 0 });
+  m.requests++;
+  if (outcome === "ok") { m.ok++; m.lastServed = Date.now(); if (tokens) { m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0; } }
+  else if (outcome === "fail") m.failed++;
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(USAGE_PATH, JSON.stringify({ startedAt: USAGE.startedAt, models: USAGE.models, events: USAGE.events })); } catch {}
+}
+function meterEvent(text) { USAGE.events.unshift({ t: Date.now(), text: String(text).slice(0, 160) }); if (USAGE.events.length > 50) USAGE.events.pop(); }
+
 const PORT = process.env.BELAY_PORT || process.env.FABRIC_PORT || cfg.port || 4000;
 const TS_IP = process.env.BELAY_TS_IP || process.env.FABRIC_TS_IP || cfg.tailnetIp || ""; // empty = loopback-only bind (bot machines)
 const LITELLM = { host: (cfg.litellm && cfg.litellm.host) || "127.0.0.1", port: (cfg.litellm && cfg.litellm.port) || 4001 };
@@ -221,6 +237,7 @@ function openAnthropicStream(res, model, tag, tagAlways) {
   if (tag && tagAlways) {
     const i = openBlock({ type: "thinking", thinking: "" });
     sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: tag + "\n" } });
+    sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: "sig_router" } });
     closeBlock(i);
     tagEmitted = true;
   }
@@ -242,8 +259,9 @@ function pipeGrokSSE(upRes, res, model, tag) {
   let thinkIdx = -1;
   // anthropic blocks are sequential: opening one kind closes the other; blocks REOPEN
   // as the upstream alternates (glm streams reasoning first, then content).
+  const closeThink = () => { if (thinkIdx >= 0) { sseWrite(res, "content_block_delta", { type: "content_block_delta", index: thinkIdx, delta: { type: "signature_delta", signature: "sig_router" } }); s.closeBlock(thinkIdx); thinkIdx = -1; } };
   const openThink = () => { if (thinkIdx < 0) { if (s.textIdx >= 0) s.closeBlock(s.textIdx); thinkIdx = s.openBlock({ type: "thinking", thinking: "" }); if (tag && !s.tagEmitted) { sseWrite(res, "content_block_delta", { type: "content_block_delta", index: thinkIdx, delta: { type: "thinking_delta", thinking: tag + "\n" } }); s.tagEmitted = true; } } };
-  const openText = () => { if (s.textIdx < 0) { if (thinkIdx >= 0) s.closeBlock(thinkIdx); s.textIdx = s.openBlock({ type: "text", text: "" }); } };
+  const openText = () => { if (s.textIdx < 0) { closeThink(); s.textIdx = s.openBlock({ type: "text", text: "" }); } };
   upRes.on("data", (chunk) => {
     buf += chunk.toString("utf8");
     let idx;
@@ -252,7 +270,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); return; }
       try {
         const j = JSON.parse(payload);
         const d = (j.choices || [{}])[0].delta || {};
@@ -269,7 +287,7 @@ function pipeGrokSSE(upRes, res, model, tag) {
           let bIdx = s.toolIdx && s.toolIdx.get(key);
           if (bIdx === undefined) {
             if (s.textIdx >= 0) s.closeBlock(s.textIdx);
-            if (thinkIdx >= 0) s.closeBlock(thinkIdx);
+            closeThink();
             const fn = (tc.function && typeof tc.function === "object") ? tc.function : {};
             bIdx = s.openBlock({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_sse_" + key), name: (typeof fn.name === "string" && fn.name) || "" });
             (s.toolIdx || (s.toolIdx = new Map())).set(key, bIdx);
@@ -281,8 +299,8 @@ function pipeGrokSSE(upRes, res, model, tag) {
       } catch {}
     }
   });
-  upRes.on("end", () => { if (!res.writableEnded) { s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
-  upRes.on("error", () => { if (!res.writableEnded) { s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); anthropicStreamEnd(res, "end_turn", usage); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
@@ -291,7 +309,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
   const s = openAnthropicStream(res, model, tag, true);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
-  const closeThink = () => { if (thinkIdx >= 0) { s.closeBlock(thinkIdx); thinkIdx = -1; } };
+  const closeThink = () => { if (thinkIdx >= 0) { sseWrite(res, "content_block_delta", { type: "content_block_delta", index: thinkIdx, delta: { type: "signature_delta", signature: "sig_router" } }); s.closeBlock(thinkIdx); thinkIdx = -1; } };
   upRes.on("data", (chunk) => {
     buf += chunk.toString("utf8");
     let idx;
@@ -881,7 +899,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   return new Promise((resolve, reject) => {
     const b = Buffer.from(JSON.stringify(ob));
     const up = http.request({ host: LITELLM.host, port: LITELLM.port, method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json", "authorization": typeof req.headers.authorization === "string" ? req.headers.authorization : "", "content-length": Buffer.byteLength(b) } }, (ur) => {
-      if (isFail(ur.statusCode)) { ur.resume(); reject(new Error("litellm " + ur.statusCode)); return; }
+      if (isFail(ur.statusCode)) { ur.resume(); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm ${ur.statusCode}`); reject(new Error("litellm " + ur.statusCode)); return; }
       if (wantStream) {
         if (dialect) { // openai-chat SSE -> anthropic SSE (sink) -> client dialect SSE
           const sink = anthropicSink();
@@ -890,6 +908,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
         } else {
           pipeGrokSSE(ur, res, model, tag); // anthropic client: openai-chat SSE -> anthropic SSE directly
         }
+        meter(model, "ok");
         ur.on("end", resolve);
         return;
       }
@@ -903,7 +922,8 @@ function litellmLane(req, res, body, model, wantStream, opts) {
         const anth = applyRouteTag(openAIToAnthropic(model, parsed, reqModel), tag);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(dialect === "responses" ? anthropicToResponses(model, anth, reqModel) : (dialect === "openai-chat" ? anthropicToOpenAIChat(model, anth, reqModel) : anth)));
-        resolve();
+        meter(model, "ok", { in: (anth.usage || {}).input_tokens, out: (anth.usage || {}).output_tokens });
+        resolve({ tokens: { in: (anth.usage || {}).input_tokens, out: (anth.usage || {}).output_tokens } });
       });
     });
     up.on("error", reject);
@@ -947,11 +967,14 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         const out = await serveGrok(model, body, sink, tag);
         if (out.streamed) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
+          meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
           return;
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(edge ? (rsp ? anthropicToResponses(model, applyRouteTag(out.body, tag), reqModel) : anthropicToOpenAIChat(model, applyRouteTag(out.body, tag), reqModel)) : applyRouteTag(out.body, tag)));
+        const _u = (out.body && out.body.usage) || {};
+        meter(model, "ok", { in: _u.input_tokens, out: _u.output_tokens }); meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
         console.log(`[ladder] ${chain[0]} -> served by ${model}`);
         return;
       }
@@ -960,18 +983,24 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         const out = await serveGPT(model, body, sink, tag);
         if (out.streamed) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
+          meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
           return;
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(edge ? (rsp ? anthropicToResponses(model, applyRouteTag(out.body, tag), reqModel) : anthropicToOpenAIChat(model, applyRouteTag(out.body, tag), reqModel)) : applyRouteTag(out.body, tag)));
+        const _u = (out.body && out.body.usage) || {};
+        meter(model, "ok", { in: _u.input_tokens, out: _u.output_tokens }); meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
         console.log(`[ladder] ${chain[0]} -> served by ${model}`);
         return;
       }
-      await litellmLane(req, res, body, model, wantStream, edge ? { dialect, reqModel, tag } : { tag });
+      const _r = await litellmLane(req, res, body, model, wantStream, edge ? { dialect, reqModel, tag } : { tag });
+      meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
       console.log(`[ladder] ${chain[0]} -> served by ${model}`);
       return;
     } catch (e) {
+      if (c && (c.lane === "grok" || c.lane === "gpt")) meter(model, "fail"); // litellm lane meters itself
+      meterEvent(`[ladder] ${model} failed: ${errText(e).slice(0, 90)}`);
       console.log(`[ladder] ${model} failed: ${errText(e).slice(0, 100)}`);
     }
   }
@@ -1117,12 +1146,31 @@ async function handleResponses(req, res, body) {
 }
 
 function handleRequest(req, res) {
-  refreshConfig(); // PRD-002: hot-reload fabric.config.json on mtime change; invalid configs keep serving the last known good
-  if (!authorized(req)) { // HIGH-1: reject before buffering the body; drain so the 401 flushes cleanly
+  refreshConfig(); // PRD-002: hot-reload the config on mtime change; invalid configs keep serving the last known good
+  if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/dashboard"))) { // PRD-005: static UI, public; data endpoints stay auth-gated
+    try {
+      const html = fs.readFileSync(path.join(__dirname, "dashboard.html"));
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(html);
+    } catch {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("dashboard.html not found beside server.js");
+    }
+    return;
+  }
+  if (!authorized(req)) { // HIGH-1: auth gate before any data; only the static dashboard UI is public
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { message: "unauthorized: missing or invalid bearer token" } }));
     req.resume();
     return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), models: USAGE.models, events: USAGE.events.slice(0, 30) }));
+  }
+  if (req.method === "GET" && req.url.startsWith("/v1/config")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify(cfg, null, 2));
   }
   const chunks = [];
   let bodyBytes = 0;
@@ -1138,6 +1186,18 @@ function handleRequest(req, res) {
   });
   req.on("end", async () => {
     let bodyBuf = Buffer.concat(chunks);
+    if (req.method === "POST" && req.url.startsWith("/v1/config")) { // PRD-005: config editor write-back; validated, atomic, hot-reloaded
+      let nc;
+      try { nc = JSON.parse(bodyBuf.toString("utf8")); }
+      catch { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { message: "config body is not valid JSON" } })); }
+      const cerr = validateConfig(nc);
+      if (cerr) { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { message: "config rejected: " + cerr } })); }
+      try { fs.writeFileSync(CONFIG_PATH + ".tmp", JSON.stringify(nc, null, 2)); fs.renameSync(CONFIG_PATH + ".tmp", CONFIG_PATH); }
+      catch (e) { res.writeHead(500, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { message: "config write failed: " + errText(e).slice(0, 80) } })); }
+      refreshConfig();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, note: "config written; hot reload applied" }));
+    }
     if (req.url.includes("/v1/images/generate")) {
       let imgBody;
       try { imgBody = JSON.parse(bodyBuf.toString("utf8") || "{}"); }
