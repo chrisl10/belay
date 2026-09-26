@@ -227,6 +227,7 @@ function sseWrite(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.s
 // Open a message; optionally lead with a tag-only thinking block (route visibility),
 // then the text block. Returns block-index helpers for multi-block streams.
 function openAnthropicStream(res, model, tag, tagAlways) {
+  if (res.headersSent) throw new Error("client stream already started; refusing to restart");
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
   let next = 0;
@@ -251,6 +252,10 @@ function anthropicStreamEnd(res, stopReason, usage) {
   res.end();
 }
 
+// PRD-005 diagnostic: ring of recent raw client-dialect streams. When a client
+// reports a malformed stream, the exact bytes are here instead of a guessing game.
+const CAPTURE_DIR = path.join(DATA_DIR, "captures");
+const captureOn = process.env.BELAY_CAPTURE !== "0";
 // grok/openai-chat: openai chat SSE -> anthropic SSE. Maps streaming tool_calls
 // deltas to tool_use blocks and reasoning_content to thinking blocks (PRD-003/004);
 // leads with the route tag so the user sees who served, in-stream.
@@ -382,7 +387,7 @@ function pipeGPTSSE(upRes, res, model, tag) {
     }
   });
   upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); sseWrite(res, "error", { type: "error", error: { type: "api_error", message: "upstream connection failed mid stream; retry the turn" } }); res.end(); } });
 }
 
 // ---------- PRD-001b B-6: anthropic SSE -> openai chat SSE (inverse of pipeGrokSSE) ----------
@@ -944,6 +949,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
     const up = http.request({ host: LITELLM.host, port: LITELLM.port, method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json", "authorization": typeof req.headers.authorization === "string" ? req.headers.authorization : "", "content-length": Buffer.byteLength(b) } }, (ur) => {
       if (isFail(ur.statusCode)) { ur.resume(); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm ${ur.statusCode}`); reject(new Error("litellm " + ur.statusCode)); return; }
       if (wantStream) {
+        if (opts) opts.streamed = true; // client bytes flowing: the ladder must not walk past this point
         if (dialect) { // openai-chat SSE -> anthropic SSE (sink) -> client dialect SSE
           const sink = anthropicSink();
           pipeGrokSSE(ur, sink, model, tag);
@@ -1000,6 +1006,8 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
   const edge = chat || rsp;
   const chain = [startModel, ...((CHAINS[startModel] || []).filter((m) => m !== startModel))];
   const wantStream = !!body.stream;
+  let clientStreaming = false; // once client bytes flowed, a failed hop must NOT walk: it would
+                               // writeHead an already-started response and kill the process.
   for (let i = 0; i < chain.length; i++) {
     const model = chain[i];
     const c = CANDIDATES[model];
@@ -1008,6 +1016,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
       if (c && c.lane === "grok") {
         const sink = edge && wantStream ? anthropicSink() : res;
         const out = await serveGrok(model, body, sink, tag);
+        if (out.streamed) clientStreaming = true;
         if (out.streamed) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
@@ -1024,6 +1033,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
       if (c && c.lane === "gpt") {
         const sink = edge && wantStream ? anthropicSink() : res;
         const out = await serveGPT(model, body, sink, tag);
+        if (out.streamed) clientStreaming = true;
         if (out.streamed) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
@@ -1037,13 +1047,19 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         console.log(`[ladder] ${chain[0]} -> served by ${model}`);
         return;
       }
-      const _r = await litellmLane(req, res, body, model, wantStream, edge ? { dialect, reqModel, tag } : { tag });
+      const _opts = edge ? { dialect, reqModel, tag, streamed: false } : { tag, streamed: false };
+      const _r = await litellmLane(req, res, body, model, wantStream, _opts);
+      if (_opts.streamed) clientStreaming = true;
       meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
       console.log(`[ladder] ${chain[0]} -> served by ${model}`);
       return;
     } catch (e) {
       if (c && (c.lane === "grok" || c.lane === "gpt")) meter(model, "fail"); // litellm lane meters itself
       meterEvent(`[ladder] ${model} failed: ${errText(e).slice(0, 90)}`);
+      if (clientStreaming) { // PRD-005: client bytes already flowed; the lane closed the client stream
+        console.log(`[ladder] ${chain[0]} -> stream aborted mid-flight (no walk; client stream owned by lane)`);
+        return;
+      }
       console.log(`[ladder] ${model} failed: ${errText(e).slice(0, 100)}`);
     }
   }
@@ -1190,6 +1206,22 @@ async function handleResponses(req, res, body) {
 
 function handleRequest(req, res) {
   refreshConfig(); // PRD-002: hot-reload the config on mtime change; invalid configs keep serving the last known good
+  // PRD-005 diagnostic: keep the raw bytes of recent SSE streams. When a client
+  // reports a malformed stream the exact bytes are on disk, not a guessing game.
+  const _cap = [];
+  const _w = res.write.bind(res), _e = res.end.bind(res);
+  res.write = (c, ...a) => { if (typeof c === "string" && _cap.length < 8192) _cap.push(c); return _w(c, ...a); };
+  res.end = (c, ...a) => {
+    try {
+      if (_cap.length && _cap.some((x) => x.includes("event:"))) {
+        fs.mkdirSync(CAPTURE_DIR, { recursive: true });
+        fs.writeFileSync(path.join(CAPTURE_DIR, "stream-" + Date.now() + "-" + Math.floor(Math.random() * 1e4) + ".sse"), _cap.join(""));
+        const all = fs.readdirSync(CAPTURE_DIR).filter((x) => x.endsWith(".sse")).sort();
+        while (all.length > 6) fs.unlinkSync(path.join(CAPTURE_DIR, all.shift()));
+      }
+    } catch {}
+    return _e(c, ...a);
+  };
   if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/dashboard"))) { // PRD-005: static UI, public; data endpoints stay auth-gated
     try {
       const html = fs.readFileSync(path.join(__dirname, "dashboard.html"));
