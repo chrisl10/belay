@@ -70,6 +70,14 @@ expands to your Hop-2 fallback list. Lanes: direct OAuth subscriptions
 (ChatGPT/Codex, Grok CLI), OpenAI-compatible proxies (LiteLLM), and
 OpenRouter-style HTTP APIs.
 
+## Dashboard (built in)
+
+Open `http://127.0.0.1:4000/` in a browser: live usage per route (requests,
+tokens, failures), the ladder feed, and a config editor that saves + hot-reloads
+the router. Same auth as the API; a
+[SwiftBar](https://swiftbar.app) plugin ships in
+[swiftbar/](swiftbar/) for macOS menu-bar usage.
+
 ## Docs
 
 - [QUICKSTART.md](QUICKSTART.md): zero to first routed request

@@ -30,7 +30,7 @@ jobs:
       - name: no personal infrastructure (the no-bleed guard)
         run: |
           if grep -rniE "100\.117\.|macdev|chris\.lyle|fabric-fleet|z\.ai/api|chrisl10/fabric-fleet" \
-             --include="*.js" --include="*.json" --include="*.md" --include="*.yml" \
+             --include="*.js" --include="*.json" --include="*.md" --include="*.yml" --include="*.html" \
              --exclude-dir=node_modules . ; then
             echo "::error::personal infrastructure references found"; exit 1
           fi

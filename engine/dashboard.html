@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>belay</title>
+<style>
+  :root { --bg:#0d1117; --panel:#0a0e16; --line:#30363d; --fg:#e6edf3; --dim:#8b949e; --ok:#34d399; --warn:#f59e0b; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif; }
+  h1 { font:700 26px ui-monospace,Menlo,monospace; margin:0 0 2px; }
+  h1 span { color:var(--ok); }
+  .sub { color:var(--dim); margin-bottom:20px; }
+  h2 { font:600 15px ui-monospace,Menlo,monospace; color:var(--dim); text-transform:uppercase; letter-spacing:1px; margin:26px 0 10px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:18px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; border-bottom:1px solid var(--line); }
+  td { padding:8px; border-bottom:1px solid #1c2129; }
+  tr:last-child td { border-bottom:none; }
+  .bar-wrap { background:#161b22; border-radius:4px; height:8px; width:100%; min-width:120px; }
+  .bar { height:8px; border-radius:4px; background:linear-gradient(90deg,#34d399,#a3e635); }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:13px; }
+  .dim { color:var(--dim); }
+  .ok { color:var(--ok); } .warn { color:var(--warn); }
+  .feed { font-family:ui-monospace,Menlo,monospace; font-size:12.5px; }
+  .feed div { padding:3px 0; border-bottom:1px solid #1c2129; }
+  #cfg { width:100%; min-height:340px; background:#0b0f16; color:#c9d1d9; border:1px solid var(--line); border-radius:8px; padding:12px; font:12.5px ui-monospace,Menlo,monospace; }
+  button { background:#238636; color:#fff; border:none; border-radius:6px; padding:8px 18px; font-weight:600; cursor:pointer; }
+  button:hover { background:#2ea043; }
+  #status { margin-left:12px; font-family:ui-monospace,Menlo,monospace; font-size:13px; }
+  .err { color:#f85149; } .good { color:var(--ok); }
+  #keybox { max-width:420px; }
+  #keybox input { width:100%; background:#0b0f16; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px; font-family:ui-monospace,Menlo,monospace; }
+</style>
+</head>
+<body>
+  <h1>bela<span>y</span></h1>
+  <div class="sub">uptime <span id="uptime" class="mono">-</span> &middot; refresh every 5s &middot; <span id="who" class="dim"></span></div>
+
+  <div id="keybox" class="card">
+    <div style="margin-bottom:8px">bearer key</div>
+    <input id="key" type="password" placeholder="paste your belay bearer key" oninput="saveKey(this.value)">
+    <div class="dim" style="margin-top:6px">stored in localStorage on this machine only</div>
+  </div>
+
+  <div id="content" style="display:none">
+    <h2>usage by route</h2>
+    <div class="card">
+      <table id="usage"><thead><tr>
+        <th>route</th><th>requests</th><th>ok</th><th>failed</th><th>tokens in</th><th>tokens out</th><th>share</th><th>last served</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+
+    <h2>ladder feed</h2>
+    <div class="card feed" id="feed"></div>
+
+    <h2>config (hops, chains, glyphs) &mdash; saving hot-reloads the router</h2>
+    <div class="card">
+      <textarea id="cfg" spellcheck="false"></textarea>
+      <div style="margin-top:10px"><button onclick="saveCfg()">Save config</button><span id="status"></span></div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const key = () => localStorage.getItem("belayKey") || "";
+function saveKey(v) { localStorage.setItem("belayKey", v); if (v) boot(); }
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({ headers: { authorization: "Bearer " + key() } }, opts || {}));
+  if (r.status === 401) { $("content").style.display = "none"; $("keybox").style.display = "block"; throw new Error("unauthorized"); }
+  if (!r.ok) throw new Error((await r.text()).slice(0, 160));
+  return r;
+}
+async function loadUsage() {
+  const j = await (await api("/v1/usage")).json();
+  $("uptime").textContent = Math.floor(j.uptimeSec / 3600) + "h " + Math.floor(j.uptimeSec % 3600 / 60) + "m";
+  const rows = Object.entries(j.models || {}).sort((a, b) => b[1].requests - a[1].requests);
+  const max = Math.max(1, ...rows.map(([, m]) => m.requests));
+  $("usage").querySelector("tbody").innerHTML = rows.map(([name, m]) => {
+    const last = m.lastServed ? Math.max(0, Math.floor((Date.now() - m.lastServed) / 1000)) + "s ago" : "never";
+    return `<tr><td class="mono">${name}</td><td class="mono">${m.requests}</td><td class="mono ok">${m.ok}</td>` +
+      `<td class="mono ${m.failed ? "warn" : "dim"}">${m.failed}</td><td class="mono">${m.tokensIn || 0}</td><td class="mono">${m.tokensOut || 0}</td>` +
+      `<td><div class="bar-wrap"><div class="bar" style="width:${Math.round(100 * m.requests / max)}%"></div></div></td><td class="dim mono">${last}</td></tr>`;
+  }).join("") || '<tr><td class="dim">no requests yet</td></tr>';
+  $("feed").innerHTML = (j.events || []).map((e) => `<div><span class="dim">${new Date(e.t).toLocaleTimeString()}</span> ${e.text.replace(/</g, "&lt;")}</div>`).join("") || '<div class="dim">quiet so far</div>';
+}
+async function loadCfg() { $("cfg").value = await (await api("/v1/config")).text(); }
+async function saveCfg() {
+  try {
+    JSON.parse($("cfg").value); // local sanity first
+    const r = await api("/v1/config", { method: "POST", headers: { "content-type": "application/json" }, body: $("cfg").value });
+    $("status").className = "good"; $("status").textContent = (await r.json()).note;
+  } catch (e) { $("status").className = "err"; $("status").textContent = String(e.message || e).slice(0, 160); }
+}
+let timer = null;
+function boot() {
+  if (!key()) { $("keybox").style.display = "block"; $("content").style.display = "none"; return; }
+  $("keybox").style.display = "none"; $("content").style.display = "block";
+  loadUsage().catch((e) => { $("status").className = "err"; $("status").textContent = e.message; });
+  loadCfg().catch(() => {});
+  if (!timer) timer = setInterval(() => loadUsage().catch(() => {}), 5000);
+}
+if (key()) { $("key").value = key(); boot(); }
+</script>
+</body>
+</html>
