@@ -31,8 +31,10 @@ summary carries the routed identity, one glyph per route, config-driven:
 · 🌍or-cheap ·    <- an external fallback served this
 ```
 
-You see exactly who handled the task while the work streams by. Glyphs and
-short names are per-candidate config; unknown routes show 🌍.
+You also see HOW HARD the task was: every auto request classifies difficulty
+(trivial/routine/complex/frontier) in the same routing call, and the tag
+carries it. You see who handled the task and why, while the work streams by.
+Glyphs and short names are per-candidate config; unknown routes show 🌍.
 
 ## Feature table
 

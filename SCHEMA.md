@@ -34,3 +34,41 @@ the last known good keeps serving.
 - `candidates` non-empty; every candidate needs a known lane and a `mods` array.
 - Every `chains` key must be a candidate; every hop must be a candidate or `@openrouter`.
 - `litellm`, when present, needs a string `host` and numeric `port`.
+
+## Routing quality fields (auto.*)
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `auto.question` | string | capability-first wording | The jev routing question. Default: capability is the constraint, cost the tiebreaker among capable models. |
+| `auto.laneBudgetTokens` | number | 500000 | Soft per-lane daily token budget. The engine feeds each candidate's real `projectedRemainingRatio` (tokens-today vs this budget) plus `recentFailures` to jev, so routing avoids nearly-exhausted lanes instead of walking 429s. |
+| `auto.maxTaskChars` | number | 2000 | Task slice sent to the routing decision. |
+
+Difficulty: every `auto` request also asks jev to classify the task
+(trivial / routine / complex / frontier) in the same call. The route tag
+carries it in-stream, e.g. `\u00b7 \ud83d\udca8flash:trivial \u00b7` vs
+`\u00b7 \ud83c\udf10glm:frontier \u00b7`, and the log line shows both:
+`[auto] typesafe -> glm-5.3 (frontier, 122ms)`.
+
+## Per-candidate display fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `candidates.<name>.glyph` | string | Emoji shown in the route tag (class default otherwise; unknown/external routes show a globe). |
+| `candidates.<name>.tag` | string | Short name in the route tag (defaults to the model id). |
+
+`routeTag: { "enabled": true }` toggles tagging entirely.
+
+## Operational endpoints (bearer-gated except the dashboard UI)
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/` | GET | The dashboard (static UI; data fetched client-side with your key). |
+| `/v1/health` | GET | uptime, pid, empty-walk count, capture-ring stats. First stop in the troubleshooting runbook. |
+| `/v1/usage` | GET | per-model requests/tokens/failures + the ladder event feed. |
+| `/v1/config` | GET | the live config. |
+| `/v1/config` | POST | validated, atomic config write-back; hot-reloads the router. |
+| `/v1/images/generate` | POST | image ladder (subscription lane first, paid fallback). |
+
+Diagnostics: the engine keeps the last 6 raw client-dialect streams under
+`BELAY_DATA/captures/` (disable with `BELAY_CAPTURE=0`). Stream bugs are
+diagnosed from these bytes; see the troubleshooting runbook pattern.
