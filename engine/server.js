@@ -62,13 +62,18 @@ if (!cfg) { console.error("[config] no valid config at " + CONFIG_PATH + " - ref
 const DATA_DIR = process.env.BELAY_DATA || process.env.FABRIC_DATA || path.join(H, "belay");
 const USAGE_PATH = path.join(DATA_DIR, "usage.json");
 const USAGE = { startedAt: Date.now(), models: {}, events: [] };
-try { const d = JSON.parse(fs.readFileSync(USAGE_PATH, "utf8")); USAGE.models = d.models || {}; USAGE.events = (d.events || []).slice(0, 50); } catch {}
+try { const d = JSON.parse(fs.readFileSync(USAGE_PATH, "utf8")); USAGE.models = d.models || {}; USAGE.day = d.day || { date: new Date().toISOString().slice(0, 10), models: {} }; USAGE.events = (d.events || []).slice(0, 50); } catch {}
 function meter(model, outcome, tokens) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
+  const dm = USAGE.day.models[model] || (USAGE.day.models[model] = { tokens: 0, fails: 0 });
+  if (outcome === "ok" && tokens) dm.tokens += (tokens.in || 0) + (tokens.out || 0);
+  if (outcome === "fail") dm.fails++;
   const m = USAGE.models[model] || (USAGE.models[model] = { requests: 0, ok: 0, failed: 0, tokensIn: 0, tokensOut: 0, lastServed: 0 });
   m.requests++;
   if (outcome === "ok") { m.ok++; m.lastServed = Date.now(); if (tokens) { m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0; } }
   else if (outcome === "fail") m.failed++;
-  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(USAGE_PATH, JSON.stringify({ startedAt: USAGE.startedAt, models: USAGE.models, events: USAGE.events })); } catch {}
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(USAGE_PATH, JSON.stringify({ startedAt: USAGE.startedAt, day: USAGE.day, models: USAGE.models, events: USAGE.events })); } catch {}
 }
 function meterEvent(text) { USAGE.events.unshift({ t: Date.now(), text: String(text).slice(0, 160) }); if (USAGE.events.length > 50) USAGE.events.pop(); }
 
@@ -177,15 +182,32 @@ async function decideAuto(messages) {
   const task = safeMessages(messages).filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
   const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")));
+  // Real per-lane signals (PRD-005 meter): tokens burned today vs the configured
+  // soft budget -> projectedRemainingRatio; recent failures penalize. The router
+  // now avoids nearly-exhausted lanes instead of picking them and eating a 429 walk.
+  const budget = (cfg.auto && cfg.auto.laneBudgetTokens) || 500000;
+  const today = new Date().toISOString().slice(0, 10);
+  if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
   const criteria = {};
-  for (const k of eligible) criteria[k] = { agent: k, projectedRemainingRatio: 0.5, capabilities: CANDIDATES[k].mods, supportedEfforts: ["low", "high", "max"] };
+  for (const k of eligible) {
+    const d = USAGE.day.models[k] || { tokens: 0, fails: 0 };
+    const ratio = Math.max(0.05, Math.min(1, 1 - d.tokens / budget));
+    criteria[k] = { agent: k, projectedRemainingRatio: ratio, tokensToday: d.tokens, recentFailures: d.fails, capabilities: CANDIDATES[k].mods, supportedEfforts: ["low", "high", "max"] };
+  }
   const t0 = Date.now();
-  const q = choice((cfg.auto && cfg.auto.question) || "Which model should handle this coding task? Pick the cheapest subscription model that is clearly sufficient; frontier models only for hard work.", criteria);
-  const result = await client.systemOne({ state: { task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000) }, questions: { route: q } });
+  const q = choice((cfg.auto && cfg.auto.question) || "Which model should handle this coding task? Pick the cheapest model that is FULLY CAPABLE of completing it correctly. Capability is the constraint; cost is the tiebreaker among capable models.", criteria);
+  const dq = choice("Classify the difficulty of this task.", {
+    trivial: { agent: "trivial", description: "mechanical: lookup, formatting, rename" },
+    routine: { agent: "routine", description: "standard implementation, clear requirements" },
+    complex: { agent: "complex", description: "multi-system, ambiguous, or performance-sensitive" },
+    frontier: { agent: "frontier", description: "deep reasoning, security-sensitive, architectural" },
+  });
+  const result = await client.systemOne({ state: { task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000) }, questions: { route: q, difficulty: dq } });
   const picked = (result.answers.route || {}).choice;
+  const difficulty = (result.answers.difficulty || {}).choice || "";
   if (!CANDIDATES[picked]) throw new Error("bad pick " + JSON.stringify(picked));
-  console.log(`[auto] typesafe -> ${picked} (${Date.now() - t0}ms)`);
-  return picked;
+  console.log(`[auto] typesafe -> ${picked} (${difficulty || "?"}, ${Date.now() - t0}ms)`);
+  return { model: picked, difficulty };
 }
 
 function anthropicToOpenAI(body) {
@@ -251,7 +273,7 @@ function openAnthropicStream(res, model, tag, tagAlways) {
   };
   // text block opens lazily on the first text delta - an empty text block
   // (start+stop, no deltas) reads as a malformed stream to clients.
-  return { textIdx: -1, tagEmitted, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
+  return { textIdx: -1, get tagEmitted() { return tagEmitted; }, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
 }
 function anthropicStreamEnd(res, stopReason, usage) {
   sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { output_tokens: (usage && usage.output_tokens) || 0 } });
@@ -1055,7 +1077,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
   for (let i = 0; i < chain.length; i++) {
     const model = chain[i];
     const c = CANDIDATES[model];
-    const tag = routeTagFor(model, body._routeEffort); // PRD-004: tag rides the stream/reasoning of whichever hop serves
+    const tag = routeTagFor(model, body._routeDifficulty || body._routeEffort); // tag carries difficulty (PRD-006 C) or client effort
     try {
       if (c && c.lane === "grok") {
         const sink = edge && wantStream ? anthropicSink() : res;
@@ -1207,7 +1229,7 @@ async function handleChatCompletions(req, res, body) {
     startModel = "auto"; // absent / "auto" / unknown model -> auto (B-3)
   }
   if (startModel === "auto") {
-    try { startModel = await decideAuto(translated.messages); }
+    try { const _p = await decideAuto(translated.messages); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
     catch (e) {
       const t = JSON.stringify(translated.messages || []).toLowerCase();
       const { image, video } = detectModalities(translated.messages);
@@ -1235,7 +1257,7 @@ async function handleResponses(req, res, body) {
   translated._routeEffort = effort; // PRD-004: rides the route tag
   let startModel = checked.passthrough ? "auto" : checked.model;
   if (startModel === "auto") {
-    try { startModel = await decideAuto(translated.messages); }
+    try { const _p = await decideAuto(translated.messages); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
     catch (e) {
       const t = JSON.stringify(translated.messages || []).toLowerCase();
       const { image, video } = detectModalities(translated.messages);
@@ -1359,7 +1381,7 @@ function handleRequest(req, res) {
     let startModel = parsed.model;
     try {
       if (startModel === "auto") {
-        try { startModel = await decideAuto(parsed.messages); }
+        try { const _p = await decideAuto(parsed.messages); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
         catch (e) {
           const t = JSON.stringify(parsed.messages || []).toLowerCase();
           const { image, video } = detectModalities(parsed.messages);

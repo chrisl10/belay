@@ -2,25 +2,59 @@
   "version": 1,
   "port": 4000,
   "tailnetIp": "",
-  "litellm": { "host": "127.0.0.1", "port": 4001 },
-  "openrouterFallbacks": ["or-cheap-flash", "or-cheap-chat"],
+  "litellm": {
+    "host": "127.0.0.1",
+    "port": 4001
+  },
+  "openrouterFallbacks": [
+    "or-cheap-flash",
+    "or-cheap-chat"
+  ],
   "candidates": {
-    "big":  { "class": "frontier",  "mods": ["text"], "lane": "litellm", "glyph": "🚀", "tag": "big" },
-    "fast": { "class": "fast",      "mods": ["text"], "lane": "litellm", "glyph": "⚡", "tag": "fast" }
+    "big": {
+      "class": "frontier",
+      "mods": [
+        "text"
+      ],
+      "lane": "litellm",
+      "glyph": "🚀",
+      "tag": "big"
+    },
+    "fast": {
+      "class": "fast",
+      "mods": [
+        "text"
+      ],
+      "lane": "litellm",
+      "glyph": "⚡",
+      "tag": "fast"
+    }
   },
   "chains": {
-    "big":  ["fast", "@openrouter"],
-    "fast": ["big", "@openrouter"]
+    "big": [
+      "fast",
+      "@openrouter"
+    ],
+    "fast": [
+      "big",
+      "@openrouter"
+    ]
   },
   "images": {
     "default": "grok-imagine-image-2.0",
-    "bestAlias": ["best", ""],
+    "bestAlias": [
+      "best",
+      ""
+    ],
     "grokPrefix": "grok-"
   },
   "auto": {
-    "question": "Which model should handle this coding task? Pick the cheapest model that is clearly sufficient; frontier models only for hard work.",
-    "maxTaskChars": 2000
+    "question": "Which model should handle this coding task? Pick the cheapest model that is FULLY CAPABLE of completing it correctly. Capability is the constraint; cost is the tiebreaker among capable models. Choose a frontier model when the task is complex, ambiguous, security-sensitive, or needs deep reasoning; choose an economical model only when it is clearly sufficient.",
+    "maxTaskChars": 2000,
+    "laneBudgetTokens": 500000
   },
-  "routeTag": { "enabled": true },
+  "routeTag": {
+    "enabled": true
+  },
   "requiredKeys": []
 }
