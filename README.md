@@ -2,6 +2,8 @@
 
 <p align="center"><img src="docs/hero.svg" alt="belay: one endpoint, every subscription, zero wasted tokens" width="100%"></p>
 
+<p align="center"><img src="docs/demo.gif" alt="belay demo: route tags with difficulty, and a 429 ladder walk that keeps the session alive" width="88%"></p>
+
 **belay** is a single-file AI model router that sits between your coding agent
 and every subscription you already pay for. An AI in the middle picks the
 cheapest model that is clearly sufficient for each task, and when a provider
