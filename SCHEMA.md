@@ -42,6 +42,7 @@ the last known good keeps serving.
 | `auto.question` | string | capability-first wording | The jev routing question. Default: capability is the constraint, cost the tiebreaker among capable models. |
 | `auto.laneBudgetTokens` | number | 500000 | Soft per-lane daily token budget. The engine feeds each candidate's real `projectedRemainingRatio` (tokens-today vs this budget) plus `recentFailures` to jev, so routing avoids nearly-exhausted lanes instead of walking 429s. |
 | `auto.maxTaskChars` | number | 2000 | Task slice sent to the routing decision. |
+| `auto.fallbackMinTokens` | number | 2048 | Output-budget floor for `openrouter-*` fallback requests. Those models spend hidden reasoning tokens before content; small `max_tokens` values finish empty and read as failed hops. This floors the per-response GENERATION budget only - it never touches the context window (client-side, e.g. 1M) and never caps larger requests. |
 
 Difficulty: every `auto` request also asks jev to classify the task
 (trivial / routine / complex / frontier) in the same call. The route tag

@@ -16,6 +16,9 @@ That is the route tag: the glyph + short name of the model that served you,
 config-driven. It exists because a ladder can serve from a different hop than
 the one you asked for, and you should be able to see that at a glance.
 
+**Does the 2048 fallback floor limit my context window?**
+No. `auto.fallbackMinTokens` floors the per-response output budget on openrouter fallback requests only (their models spend hidden reasoning tokens before content, so tiny budgets return empty). Your context window - whatever your harness sets, e.g. 1M - is input capacity, is never touched by the engine, and larger output requests pass through uncapped.
+
 **How is this different from LiteLLM?**
 They complement each other. LiteLLM is a great OpenAI-compatible proxy; belay
 sits above it (or replaces it), adds subscription OAuth lanes, AI-driven model

@@ -1004,7 +1004,8 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   ob.model = model;
   ob.stream = !!wantStream;
   ob.reasoning_effort = (cfg.litellm && cfg.litellm.reasoningEffort) || "low"; // z.ai coding models think unboundedly without it
-  if (String(model).startsWith("openrouter") && ob.max_tokens < 2048) ob.max_tokens = 2048; // OR fallback models reason heavily; small budgets arrive empty and read as a failed hop
+  const fbMin = (cfg.auto && cfg.auto.fallbackMinTokens) || 2048; // OR fallbacks reason heavily; small generation budgets arrive EMPTY and read as failed hops. Output budget floor only - never touches context window.
+  if (String(model).startsWith("openrouter") && ob.max_tokens < fbMin) ob.max_tokens = fbMin;
   ob.allowed_openai_params = ["reasoning_effort"]; // without this LiteLLM rejects the request outright (UnsupportedParamsError -> empty stream)
   return new Promise((resolve, reject) => {
     const b = Buffer.from(JSON.stringify(ob));

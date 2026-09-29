@@ -51,7 +51,8 @@
   "auto": {
     "question": "Which model should handle this coding task? Pick the cheapest model that is FULLY CAPABLE of completing it correctly. Capability is the constraint; cost is the tiebreaker among capable models. Choose a frontier model when the task is complex, ambiguous, security-sensitive, or needs deep reasoning; choose an economical model only when it is clearly sufficient.",
     "maxTaskChars": 2000,
-    "laneBudgetTokens": 500000
+    "laneBudgetTokens": 500000,
+    "fallbackMinTokens": 2048
   },
   "routeTag": {
     "enabled": true
