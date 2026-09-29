@@ -1004,6 +1004,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   ob.model = model;
   ob.stream = !!wantStream;
   ob.reasoning_effort = (cfg.litellm && cfg.litellm.reasoningEffort) || "low"; // z.ai coding models think unboundedly without it
+  if (String(model).startsWith("openrouter") && ob.max_tokens < 2048) ob.max_tokens = 2048; // OR fallback models reason heavily; small budgets arrive empty and read as a failed hop
   ob.allowed_openai_params = ["reasoning_effort"]; // without this LiteLLM rejects the request outright (UnsupportedParamsError -> empty stream)
   return new Promise((resolve, reject) => {
     const b = Buffer.from(JSON.stringify(ob));
@@ -1308,9 +1309,17 @@ function handleRequest(req, res) {
   if (req.method === "GET" && req.url.startsWith("/v1/health")) {
     let lastCapture = 0, captureCount = 0;
     try { const cs = fs.readdirSync(CAPTURE_DIR).filter((x) => x.endsWith(".sse")); captureCount = cs.length; for (const c of cs) { const m = c.match(/stream-(\d+)-/); if (m) lastCapture = Math.max(lastCapture, Number(m[1])); } } catch {}
-    const restartsToday = (() => { try { const log = fs.readFileSync(path.join(path.dirname(USAGE_PATH), "..", "Logs", "fabric-router.log"), "utf8"); return (log.match(/fabric-router v3/g) || []).length; } catch { return -1; } })();
+    // Lane health: per-candidate attempt outcomes; a lane is DEGRADED when it has
+    // recent failures and no recent success (stale token, dead key, empty streams).
+    const lanes = {};
+    for (const [name, m] of Object.entries(USAGE.models)) {
+      const lastOkAgoSec = m.lastServed ? Math.floor((Date.now() - m.lastServed) / 1000) : null;
+      const degraded = m.failed > 0 && (m.ok === 0 || lastOkAgoSec === null || lastOkAgoSec > 3600);
+      lanes[name] = { requests: m.requests, ok: m.ok, failed: m.failed, lastOkAgoSec, degraded };
+    }
+    const degradedLanes = Object.entries(lanes).filter(([, l]) => l.degraded).map(([n]) => n);
     res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ ok: true, pid: process.pid, uptimeSec: Math.floor(process.uptime()), emptyWalks: USAGE.events.filter((e) => String(e.text).includes("empty stream")).length, captureCount, lastCapture, note: "watch /v1/usage events + ~/belay/captures when streams misbehave" }));
+    return res.end(JSON.stringify({ ok: degradedLanes.length === 0, pid: process.pid, uptimeSec: Math.floor(process.uptime()), emptyWalks: USAGE.events.filter((e) => String(e.text).includes("empty stream")).length, captureCount, lastCapture, lanes, degradedLanes, note: "degradedLanes names provider lanes failing with no recent success - fix the lane (token/key), not the router" }));
   }
   if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
     res.writeHead(200, { "content-type": "application/json" });
