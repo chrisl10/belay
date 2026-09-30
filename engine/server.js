@@ -1034,9 +1034,14 @@ async function serveGrok(model, body, res, tag) {
 async function serveGPT(model, body, res, tag) {
   const t = tokens();
   if (!t.gpt) throw new Error("no codex token");
-  const input = [];
+  const input = []; const sysParts = [];
   for (const m of safeMessages(body.messages)) {
     if (!m || typeof m !== "object") continue;
+    if (m.role === "system") { // backend 400s {"detail":"System messages are not allowed"}: fold into instructions
+      if (typeof m.content === "string") sysParts.push(m.content);
+      else if (Array.isArray(m.content)) for (const b of m.content) if (b && typeof b === "object" && b.type === "text" && typeof b.text === "string") sysParts.push(b.text);
+      continue;
+    }
     const parts = [];
     if (typeof m.content === "string") parts.push({ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content });
     else if (Array.isArray(m.content)) for (const b of m.content) {
@@ -1055,7 +1060,7 @@ async function serveGPT(model, body, res, tag) {
     gptTools.push({ type: "function", name: t.name, description: typeof t.description === "string" ? t.description : "", parameters: (t.input_schema && typeof t.input_schema === "object" && !Array.isArray(t.input_schema)) ? t.input_schema : { type: "object", properties: {} } }); // C-6: client tool defs ride the GPT lane
   }
   const ob = {
-    model, instructions: typeof body.system === "string" ? body.system : undefined,
+    model, instructions: [typeof body.system === "string" ? body.system : "", ...sysParts].filter(Boolean).join("\n\n") || undefined,
     input, tools: gptTools, tool_choice: "auto", parallel_tool_calls: false,
     reasoning: { effort: "low", summary: "auto" }, store: false, stream: wantStream,
     // max_output_tokens REMOVED: the updated backend rejects it ("Unsupported parameter");
@@ -1066,8 +1071,8 @@ async function serveGPT(model, body, res, tag) {
     "Authorization": "Bearer " + t.gpt, "chatgpt-account-id": t.acct, "content-type": "application/json",
     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.156.1", "OpenAI-Beta": "responses=experimental",
   }, JSON.stringify(ob), 240000, (status) => status === 200);
-  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag); return { streamed: true }; } throw new Error("gpt stream not honored"); }
-  if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 120)}`);
+  if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 200)}`);
+  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
   if (!r.stream) throw new Error(`gpt ${r.status}: expected event stream`);
   // non-stream client: assemble the JSON response from the upstream SSE events
   const assembled = await new Promise((resolve, reject) => {
