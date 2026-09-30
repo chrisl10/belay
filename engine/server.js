@@ -63,19 +63,50 @@ const DATA_DIR = process.env.BELAY_DATA || process.env.FABRIC_DATA || path.join(
 const USAGE_PATH = path.join(DATA_DIR, "usage.json");
 const USAGE = { startedAt: Date.now(), models: {}, events: [] };
 try { const d = JSON.parse(fs.readFileSync(USAGE_PATH, "utf8")); USAGE.models = d.models || {}; USAGE.day = d.day || { date: new Date().toISOString().slice(0, 10), models: {} }; USAGE.events = (d.events || []).slice(0, 50); } catch {}
-function meter(model, outcome, tokens) {
+function meter(model, outcome, tokens, ms) {
   const today = new Date().toISOString().slice(0, 10);
   if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
   const dm = USAGE.day.models[model] || (USAGE.day.models[model] = { tokens: 0, fails: 0 });
   if (outcome === "ok" && tokens) dm.tokens += (tokens.in || 0) + (tokens.out || 0);
   if (outcome === "fail") dm.fails++;
-  const m = USAGE.models[model] || (USAGE.models[model] = { requests: 0, ok: 0, failed: 0, tokensIn: 0, tokensOut: 0, lastServed: 0 });
+  const m = USAGE.models[model] || (USAGE.models[model] = { requests: 0, ok: 0, failed: 0, tokensIn: 0, tokensOut: 0, lastServed: 0, msTotal: 0 });
   m.requests++;
-  if (outcome === "ok") { m.ok++; m.lastServed = Date.now(); if (tokens) { m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0; } }
+  if (outcome === "ok") { m.ok++; m.lastServed = Date.now(); if (ms) m.msTotal += ms; if (tokens) { m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0; } }
   else if (outcome === "fail") m.failed++;
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(USAGE_PATH, JSON.stringify({ startedAt: USAGE.startedAt, day: USAGE.day, models: USAGE.models, events: USAGE.events })); } catch {}
 }
 function meterEvent(text) { USAGE.events.unshift({ t: Date.now(), text: String(text).slice(0, 160) }); if (USAGE.events.length > 50) USAGE.events.pop(); }
+
+// Provider pools: subscription plans are shared across their models. Quota burn,
+// utilization, and health are per-PLAN, not per-model (glm-5.3 + glm-5.3-flash
+// drain the same z.ai window; astra/sol/luna drain the same OpenAI plan).
+function providerPools() {
+  const budget = (cfg.auto && cfg.auto.laneBudgetTokens) || 500000;
+  const pools = {};
+  const poolOf = (name, lane) => {
+    if (lane === "gpt") return "openai-plan";
+    if (lane === "grok") return "grok-plan";
+    if (name.startsWith("openrouter")) return "openrouter-paygo";
+    return "zai-plan";
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
+  for (const [name, cd] of Object.entries(CANDIDATES)) {
+    const pool = poolOf(name, cd.lane);
+    const p = pools[pool] || (pools[pool] = { tokensToday: 0, failsToday: 0, models: [], budgetTokens: pool === "openrouter-paygo" ? 0 : budget });
+    p.models.push(name);
+    const d = USAGE.day.models[name] || { tokens: 0, fails: 0 };
+    p.tokensToday += d.tokens;
+    p.failsToday += d.fails;
+  }
+  for (const p of Object.values(pools)) {
+    p.utilizationToday = p.budgetTokens ? Math.min(1, p.tokensToday / p.budgetTokens) : 0;
+    const laneMs = p.models.reduce((a, n) => a + ((USAGE.models[n] || {}).msTotal || 0), 0);
+    const laneOk = p.models.reduce((a, n) => a + ((USAGE.models[n] || {}).ok || 0), 0);
+    p.avgLatencyMs = laneOk ? Math.round(laneMs / laneOk) : null;
+  }
+  return pools;
+}
 
 const PORT = process.env.BELAY_PORT || process.env.FABRIC_PORT || cfg.port || 4000;
 const TS_IP = process.env.BELAY_TS_IP || process.env.FABRIC_TS_IP || cfg.tailnetIp || ""; // empty = loopback-only bind (bot machines)
@@ -188,21 +219,52 @@ async function decideAuto(messages) {
   const budget = (cfg.auto && cfg.auto.laneBudgetTokens) || 500000;
   const today = new Date().toISOString().slice(0, 10);
   if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
+  // PRD-006 fix: jev must SEE the tier and the cost, or every pick collapses to
+  // one cheap-sounding lane. Tier from config class; relativeCost ranks the
+  // classes (1 = cheapest subscription tier, 3 = frontier); description grounds it.
+  const TIER_COST = { fast: 1, workhorse: 2, frontier: 3 };
+  const TIER_DESC = {
+    fast: "economical tier: fast, cheap, right for trivial/routine work",
+    workhorse: "workhorse tier: strong general model for routine-to-complex implementation",
+    frontier: "frontier tier: strongest models, reserve for complex/ambiguous/security-sensitive/deep-reasoning work",
+  };
+  const pools = providerPools();
+  const poolOf = (k) => (CANDIDATES[k].lane === "gpt" ? "openai-plan" : CANDIDATES[k].lane === "grok" ? "grok-plan" : (k.startsWith("openrouter") ? "openrouter-paygo" : "zai-plan"));
   const criteria = {};
   for (const k of eligible) {
     const d = USAGE.day.models[k] || { tokens: 0, fails: 0 };
-    const ratio = Math.max(0.05, Math.min(1, 1 - d.tokens / budget));
-    criteria[k] = { agent: k, projectedRemainingRatio: ratio, tokensToday: d.tokens, recentFailures: d.fails, capabilities: CANDIDATES[k].mods, supportedEfforts: ["low", "high", "max"] };
+    const pool = pools[poolOf(k)] || { utilizationToday: 0, tokensToday: 0, failsToday: 0, avgLatencyMs: null };
+    const tier = CANDIDATES[k].class || "fast";
+    const m = USAGE.models[k] || {};
+    criteria[k] = {
+      agent: k,
+      tier,
+      tierDescription: TIER_DESC[tier] || TIER_DESC.fast,
+      relativeCost: TIER_COST[tier] || 2,
+      providerPool: poolOf(k),
+      poolUtilizationToday: pool.utilizationToday,
+      projectedRemainingRatio: Math.max(0.05, 1 - pool.utilizationToday),
+      poolFailsToday: pool.failsToday,
+      tokensToday: d.tokens,
+      recentFailures: d.fails,
+      avgLatencyMs: pool.avgLatencyMs,
+      capabilities: CANDIDATES[k].mods,
+      supportedEfforts: ["low", "high", "max"],
+    };
   }
   const t0 = Date.now();
-  const q = choice((cfg.auto && cfg.auto.question) || "Which model should handle this coding task? Pick the cheapest model that is FULLY CAPABLE of completing it correctly. Capability is the constraint; cost is the tiebreaker among capable models.", criteria);
+  const q = choice((cfg.auto && cfg.auto.question) || "Which model should handle this coding task? Pick the model with the LOWEST relativeCost whose tier is fully capable of completing it correctly. Frontier-tier models are for complex, ambiguous, security-sensitive, or deep-reasoning work; do not use them for routine tasks. Economical (fast) tier is for trivial/routine work. Among equally-capable candidates, prefer the provider pool with the LOWEST poolUtilizationToday: subscription windows expire unused and exhausted windows stall work, so spread load across plans. Never pick a model whose tier risks task failure just because it is cheap.", criteria);
   const dq = choice("Classify the difficulty of this task.", {
     trivial: { agent: "trivial", description: "mechanical: lookup, formatting, rename" },
     routine: { agent: "routine", description: "standard implementation, clear requirements" },
     complex: { agent: "complex", description: "multi-system, ambiguous, or performance-sensitive" },
     frontier: { agent: "frontier", description: "deep reasoning, security-sensitive, architectural" },
   });
-  const result = await client.systemOne({ state: { task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000) }, questions: { route: q, difficulty: dq } });
+  const result = await client.systemOne({ state: {
+    task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000),
+    providerPoolsToday: pools,
+    recentLadderEvents: USAGE.events.slice(0, 6).map((e) => e.text),
+  }, questions: { route: q, difficulty: dq } });
   const picked = (result.answers.route || {}).choice;
   const difficulty = (result.answers.difficulty || {}).choice || "";
   if (!CANDIDATES[picked]) throw new Error("bad pick " + JSON.stringify(picked));
@@ -535,7 +597,7 @@ function postUpstream(host, path, headers, bodyStr, timeoutMs, onStatus) {
   });
 }
 
-const isFail = (s) => s === 429 || s === 401 || s === 403 || s >= 500;
+const isFail = (s) => s === 400 || s === 429 || s === 401 || s === 403 || s >= 500; // 400 included: error bodies must never parse as empty successes
 
 function openAIToAnthropic(model, o, reqModel) {
   const ch = (o.choices || [{}])[0] || {};
@@ -968,17 +1030,60 @@ async function serveGPT(model, body, res, tag) {
     model, instructions: typeof body.system === "string" ? body.system : undefined,
     input, tools: gptTools, tool_choice: "auto", parallel_tool_calls: false,
     reasoning: { effort: "low", summary: "auto" }, store: false, stream: wantStream,
-    max_output_tokens: body.max_tokens || 1024,
+    // max_output_tokens REMOVED: the updated backend rejects it ("Unsupported parameter");
+    // output length is plan-managed upstream
   };
+  ob.stream = true; // the backend REQUIRES streaming ("Stream must be set to true"); non-stream clients get the SSE assembled below
   const r = await postUpstream("chatgpt.com", "/backend-api/codex/responses", {
     "Authorization": "Bearer " + t.gpt, "chatgpt-account-id": t.acct, "content-type": "application/json",
     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.156.1", "OpenAI-Beta": "responses=experimental",
-  }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
-  if (wantStream && r.stream) { pipeGPTSSE(r.upRes, res, model, tag); return { streamed: true }; }
+  }, JSON.stringify(ob), 240000, (status) => status === 200);
+  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag); return { streamed: true }; } throw new Error("gpt stream not honored"); }
   if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 120)}`);
-  const out = JSON.parse(r.body);
-  if (out.error) throw new Error("gpt wrapped error: " + JSON.stringify(out.error).slice(0, 100));
-  let text = "", reasoning = "";
+  if (!r.stream) throw new Error(`gpt ${r.status}: expected event stream`);
+  // non-stream client: assemble the JSON response from the upstream SSE events
+  const assembled = await new Promise((resolve, reject) => {
+    let buf = "", text = "", reasoning = "", stop = "end_turn", usage = { input_tokens: 0, output_tokens: 0 };
+    const fns = []; let curFn = null;
+    r.upRes.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let j; try { j = JSON.parse(payload); } catch { continue; }
+        const tt = j.type || "";
+        if (tt === "response.output_text.delta" && typeof j.delta === "string") text += j.delta;
+        if (tt === "response.reasoning_summary_text.delta" && typeof j.delta === "string") reasoning += j.delta;
+        if (tt === "response.output_item.added" && (j.item || {}).type === "function_call") { curFn = { id: j.item.call_id || ("call_" + fns.length), name: j.item.name || "", args: "" }; fns.push(curFn); }
+        if (tt === "response.function_call_arguments.delta" && curFn && typeof j.delta === "string") curFn.args += j.delta;
+        if (tt === "response.completed" || tt === "response.incomplete") {
+          const u = (j.response || {}).usage || {};
+          usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+          stop = tt === "response.incomplete" ? "max_tokens" : (fns.length ? "tool_use" : "end_turn");
+        }
+        if (tt === "error" || tt === "response.failed") { reject(new Error("gpt stream error: " + JSON.stringify(j).slice(0, 100))); return; }
+      }
+    });
+    r.upRes.on("end", () => {
+      if (!text && !fns.length && !reasoning) { reject(new Error("gpt empty output")); return; }
+      const blocks = [];
+      if (reasoning) blocks.push({ type: "thinking", thinking: reasoning.slice(0, 8000), signature: "na" });
+      if (text) blocks.push({ type: "text", text });
+      for (const f of fns) {
+        let input = {}; try { const p = JSON.parse(f.args || "{}"); if (p && typeof p === "object" && !Array.isArray(p)) input = p; } catch {}
+        blocks.push({ type: "tool_use", id: f.id, name: f.name, input });
+      }
+      resolve({ content: blocks, stop_reason: stop, usage });
+    });
+    r.upRes.on("error", (e) => reject(new Error("gpt stream error: " + errText(e).slice(0, 80))));
+  });
+  return { kind: "anthropic", body: { id: "msg_router_gpt", type: "message", role: "assistant", model, content: assembled.content, stop_reason: assembled.stop_reason, stop_sequence: null, usage: assembled.usage } };
+}
+function _gptLegacyReturnUnused() {
+  const out = {}; let text = "", reasoning = "";
   for (const item of out.output || []) {
     if (item.type === "message") for (const c of item.content || []) if (c.type === "output_text" || c.text) text += c.text || "";
     if (item.type === "reasoning") reasoning += (item.summary || []).map((s) => s.text || "").join(" ");
@@ -1324,7 +1429,7 @@ function handleRequest(req, res) {
   }
   if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
     res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), models: USAGE.models, events: USAGE.events.slice(0, 30) }));
+    return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), day: USAGE.day, providerPools: providerPools(), models: USAGE.models, events: USAGE.events.slice(0, 30) }));
   }
   if (req.method === "GET" && req.url.startsWith("/v1/config")) {
     res.writeHead(200, { "content-type": "application/json" });
