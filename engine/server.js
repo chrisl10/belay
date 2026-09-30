@@ -1019,13 +1019,28 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
   upRes.on("error", () => terminal());
 }
 
+let grokRefreshAt = 0;
 async function serveGrok(model, body, res, tag) {
-  const t = tokens();
+  let t = tokens();
   if (!t.grok) throw new Error("no grok token");
   const ob = anthropicToOpenAI(body);
   ob.model = "grok-4.7";
   const wantStream = !!ob.stream;
-  const r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
+  let r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
+  if ((r.status === 401 || r.status === 403) && !r.stream) { // credential rot: refresh beside-config script (60s exec cooldown), re-read token, retry once
+    const now = Date.now();
+    if (now - grokRefreshAt > 60000) {
+      grokRefreshAt = now;
+      const rs = path.join(path.dirname(CONFIG_PATH), "grok-refresh.sh");
+      try { require("child_process").execSync("bash " + JSON.stringify(rs), { timeout: 45000, stdio: "ignore" }); console.log("[grok] " + r.status + " -> refresh script executed"); }
+      catch (e) { console.log("[grok] refresh script failed: " + errText(e).slice(0, 60)); }
+    }
+    const nt = tokens();
+    if (nt.grok && nt.grok !== t.grok) {
+      t = nt;
+      r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
+    }
+  }
   if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag); return { streamed: true }; }
   if (isFail(r.status)) throw new Error(`grok ${r.status}: ${r.body.slice(0, 120)}`);
   return { kind: "anthropic", body: openAIToAnthropic("grok-4.7", JSON.parse(r.body), model) };
