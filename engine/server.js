@@ -1102,8 +1102,8 @@ async function serveGPT(model, body, res, tag) {
     });
     r.upRes.on("end", () => {
       if (!text && !fns.length && !reasoning) {
-        try { fs.mkdirSync(CAPTURE_DIR, { recursive: true }); fs.writeFileSync(path.join(CAPTURE_DIR, "gpt-empty-" + Date.now() + ".sse"), "model=" + model + " status=" + r.status + " bytes=" + buf.length + "\n" + buf); } catch {}
-        reject(new Error("gpt empty output (raw stream captured to belay/captures/gpt-empty-*.sse)")); return; }
+        try { const d = path.join(DATA_DIR, "diag"); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, "gpt-empty-" + Date.now() + ".sse"), "model=" + model + " status=" + r.status + " bytes=" + buf.length + "\n" + buf); } catch {}
+        reject(new Error("gpt empty output (raw stream captured to belay/diag/gpt-empty-*.sse)")); return; }
       const blocks = [];
       if (reasoning) blocks.push({ type: "thinking", thinking: reasoning.slice(0, 8000), signature: "na" });
       if (text) blocks.push({ type: "text", text });
