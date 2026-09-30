@@ -1143,7 +1143,14 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   return new Promise((resolve, reject) => {
     const b = Buffer.from(JSON.stringify(ob));
     const up = http.request({ host: LITELLM.host, port: LITELLM.port, method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json", "authorization": typeof req.headers.authorization === "string" ? req.headers.authorization : "", "content-length": Buffer.byteLength(b) } }, (ur) => {
-      if (isFail(ur.statusCode)) { ur.resume(); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm ${ur.statusCode}`); reject(new Error("litellm " + ur.statusCode)); return; }
+      if (isFail(ur.statusCode)) {
+        if (ur.statusCode === 400) { // body says WHICH param offended; log it, route around it
+          const chunks = []; ur.on("data", (c) => chunks.push(c));
+          ur.on("end", () => { const b = Buffer.concat(chunks).toString("utf8").slice(0, 180); console.log(`[litellm] 400 body: ${b}`); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm 400`); reject(new Error("litellm 400: " + b)); });
+          return;
+        }
+        ur.resume(); meter(model, "fail"); meterEvent(`[ladder] ${model} failed: litellm ${ur.statusCode}`); reject(new Error("litellm " + ur.statusCode)); return;
+      }
       if (wantStream) {
         let empty = false;
         const onEmpty = () => { empty = true; };
@@ -1265,6 +1272,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
     }
   }
   if (rsp) return sendOpenAIError(res, 502, `router: all models exhausted for ${startModel}`); // C-7: responses-shaped exhaustion error
+  if (wantStream) { emitSseError(res, `router: all models exhausted for ${startModel}`); return; } // streaming clients get an SSE error event, never a raw JSON body
   res.writeHead(502, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: { message: `router: all models exhausted for ${startModel}` } }));
 }
