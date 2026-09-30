@@ -326,6 +326,10 @@ function sseWrite(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.s
 // Open a message; optionally lead with a tag-only thinking block (route visibility),
 // then the text block. Returns block-index helpers for multi-block streams.
 function openAnthropicStream(res, model, tag, tagAlways) {
+  if (res.headersSent) { // never throw from event handlers: degrade to a dead stream
+    console.log("[stream] open on already-started response - returning dead stream (walk-after-bytes escaped a guard)");
+    return { textIdx: -1, tagEmitted: true, primed: () => true, prime() {}, openBlock: () => -1, closeBlock() {}, closeAll() {} };
+  }
   let tagEmitted = false;
   let next = 0;
   const open = [];
@@ -352,6 +356,16 @@ function openAnthropicStream(res, model, tag, tagAlways) {
   // (start+stop, no deltas) reads as a malformed stream to clients.
   return { textIdx: -1, get tagEmitted() { return tagEmitted; }, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
 }
+function emitSseError(res, message) {
+  if (res.writableEnded) return;
+  try {
+    if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    if (!res.headersSent) { res.end(); return; }
+    res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message } })}\n\n`);
+    res.end();
+  } catch {}
+}
+
 function anthropicStreamEnd(res, stopReason, usage) {
   sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { output_tokens: (usage && usage.output_tokens) || 0 } });
   sseWrite(res, "message_stop", { type: "message_stop" });
@@ -434,8 +448,7 @@ function finishStream(res, usage, finish, s, toolEmitted, abnormal, onEmpty) {
     if (typeof args === "string" && args.trim()) {
       try { JSON.parse(args); }
       catch {
-        sseWrite(res, "error", { type: "error", error: { type: "api_error", message: "upstream ended mid tool call (arguments truncated); retry the turn" } });
-        res.end();
+        emitSseError(res, "upstream ended mid tool call (arguments truncated); retry the turn");
         return;
       }
     }
@@ -498,7 +511,7 @@ function pipeGPTSSE(upRes, res, model, tag, onEmpty) {
     }
   });
   upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); sseWrite(res, "error", { type: "error", error: { type: "api_error", message: "upstream connection failed mid stream; retry the turn" } }); res.end(); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); emitSseError(res, "upstream connection failed mid stream; retry the turn"); } });
 }
 
 // ---------- PRD-001b B-6: anthropic SSE -> openai chat SSE (inverse of pipeGrokSSE) ----------
