@@ -52,8 +52,21 @@ function loadConfig() {
   applyConfig(raw);
   console.log("[config] loaded v" + (raw.version || "?") + ": " + Object.keys(CANDIDATES).length + " candidates, " + Object.keys(CHAINS).length + " chains");
 }
-function refreshConfig() { try { if (fs.statSync(CONFIG_PATH).mtimeMs !== cfgMtimeMs) loadConfig(); } catch {} }
+let CATALOG = {}, catalogMtimeMs = 0;
+const CATALOG_PATH = process.env.BELAY_CATALOG || path.join(path.dirname(CONFIG_PATH), "model-catalog.json");
+function loadCatalog() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CATALOG_PATH, "utf8"));
+    CATALOG = raw.catalog || {};
+    catalogMtimeMs = fs.statSync(CATALOG_PATH).mtimeMs;
+  } catch { CATALOG = {}; }
+}
+function refreshConfig() {
+  try { if (fs.statSync(CONFIG_PATH).mtimeMs !== cfgMtimeMs) loadConfig(); } catch {}
+  try { if (fs.statSync(CATALOG_PATH).mtimeMs !== catalogMtimeMs) loadCatalog(); } catch {}
+}
 loadConfig();
+loadCatalog();
 if (!cfg) { console.error("[config] no valid config at " + CONFIG_PATH + " - refusing to start"); process.exit(1); }
 
 // ---------- PRD-005: usage metering + dashboard ----------
@@ -234,13 +247,15 @@ async function decideAuto(messages) {
   for (const k of eligible) {
     const d = USAGE.day.models[k] || { tokens: 0, fails: 0 };
     const pool = pools[poolOf(k)] || { utilizationToday: 0, tokensToday: 0, failsToday: 0, avgLatencyMs: null };
-    const tier = CANDIDATES[k].class || "fast";
+    const cat = CATALOG[k] || {};
+    const tier = cat.tier || CANDIDATES[k].class || "fast";
     const m = USAGE.models[k] || {};
     criteria[k] = {
       agent: k,
       tier,
-      tierDescription: TIER_DESC[tier] || TIER_DESC.fast,
-      relativeCost: TIER_COST[tier] || 2,
+      tierDescription: cat.useFor || TIER_DESC[tier] || TIER_DESC.fast,
+      relativeCost: cat.relativeCost || TIER_COST[tier] || 2,
+      ...(cat.contextWindow ? { contextWindow: cat.contextWindow } : {}),
       providerPool: poolOf(k),
       poolUtilizationToday: pool.utilizationToday,
       projectedRemainingRatio: Math.max(0.05, 1 - pool.utilizationToday),
