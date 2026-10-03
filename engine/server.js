@@ -26,7 +26,13 @@ function validateConfig(c) {
     if (!cd || typeof cd !== "object") return "candidate " + name + ": not an object";
     if (!["gpt", "grok", "litellm"].includes(cd.lane)) return "candidate " + name + ": unknown lane";
     if (!Array.isArray(cd.mods)) return "candidate " + name + ": mods must be an array";
+    if (cd.contextWindow !== undefined && (typeof cd.contextWindow !== "number" || cd.contextWindow <= 0)) return "candidate " + name + ": contextWindow must be a positive number";
   }
+  if (c.contextWindowOverrides) {
+    if (typeof c.contextWindowOverrides !== "object" || Array.isArray(c.contextWindowOverrides)) return "contextWindowOverrides: must be an object of model -> positive number";
+    for (const [m, w] of Object.entries(c.contextWindowOverrides)) if (typeof w !== "number" || w <= 0) return "contextWindowOverrides " + m + ": must be a positive number";
+  }
+  if (c.auto && c.auto.windowSafety !== undefined && (typeof c.auto.windowSafety !== "number" || c.auto.windowSafety <= 0 || c.auto.windowSafety > 1)) return "auto.windowSafety: must be a number in (0, 1]";
   for (const [name, chain] of Object.entries(c.chains || {})) {
     if (!Array.isArray(chain)) return "chain " + name + ": must be an array";
     if (!c.candidates[name]) return "chain " + name + ": no matching candidate";
@@ -222,10 +228,91 @@ function detectModalities(messages) {
   return { image, video };
 }
 
-async function decideAuto(messages) {
-  const task = safeMessages(messages).filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
+// ---------- context-window routing: know the size before you pick ----------
+// A prompt larger than every lane's window cannot be rescued by ANY fallback:
+// every hop 400s (grok input_too_large, glm ContextWindowExceeded), poisons the
+// lane failure counters, and the client gets a misleading 502 "all models
+// exhausted" (fleet incident 2026-10-03: a >1M-token session dead-walked every
+// chain all afternoon). So: estimate the request size first, never pick or walk
+// a lane whose window cannot fit it, and reject up front with a clear 400 when
+// nothing in the pool can serve the request. Skips are not failures - they do
+// not touch the meter, so health/degraded-lane data stays honest.
+// Window source, first wins: config contextWindowOverrides (machine truth -
+// e.g. a subscription whose real limit sits below the catalog number) ->
+// candidate.contextWindow -> model-catalog.json contextWindow -> null
+// (unknown: no constraint, the pre-window-routing behavior).
+const TOKENS_PER_CHAR = 4; // coarse chars->tokens; the windowSafety margin absorbs the drift
+const IMAGE_URL_TOKENS = 1500; // url-sourced images: size unknowable at the router, flat charge
+function estimateTokens(body) {
+  let chars = 0, imageTokens = 0;
+  const count = (c) => {
+    if (typeof c === "string") { chars += c.length; return; }
+    if (!Array.isArray(c)) { if (c != null) { try { chars += JSON.stringify(c).length; } catch {} } return; }
+    for (const b of c) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "text" && typeof b.text === "string") chars += b.text.length;
+      else if (b.type === "image") {
+        const src = b.source;
+        if (src && typeof src.data === "string") imageTokens += Math.max(256, Math.ceil((src.data.length * 3 / 4) / 600)); // decoded bytes -> tile-approximation
+        else imageTokens += IMAGE_URL_TOKENS;
+      }
+      else if (b.type === "tool_use") { try { chars += JSON.stringify(b.input == null ? {} : b.input).length; } catch {} }
+      else if (b.type === "tool_result") count(b.content);
+      else { try { chars += JSON.stringify(b).length; } catch {} }
+    }
+  };
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    if (typeof body.system === "string") chars += body.system.length;
+    else if (body.system != null) { try { chars += JSON.stringify(body.system).length; } catch {} }
+    if (Array.isArray(body.tools)) for (const t of body.tools) { try { chars += JSON.stringify(t).length; } catch {} }
+    if (Array.isArray(body.messages)) for (const m of body.messages) count(m && m.content);
+  }
+  return Math.ceil(chars / TOKENS_PER_CHAR) + imageTokens;
+}
+function windowFor(model) {
+  const ov = cfg && cfg.contextWindowOverrides && cfg.contextWindowOverrides[model];
+  if (typeof ov === "number" && ov > 0) return ov;
+  const cd = CANDIDATES[model];
+  if (cd && typeof cd.contextWindow === "number" && cd.contextWindow > 0) return cd.contextWindow;
+  const cat = CATALOG[model] || {};
+  if (typeof cat.contextWindow === "number" && cat.contextWindow > 0) return cat.contextWindow;
+  return null;
+}
+function effMaxTokens(body) {
+  if (body && typeof body.max_tokens === "number" && body.max_tokens > 0) return body.max_tokens;
+  return 4096; // assume a real agent output budget when the client omits it
+}
+function windowFits(model, est, maxTokens) {
+  const w = windowFor(model);
+  if (!w) return true;
+  const safety = (cfg && cfg.auto && typeof cfg.auto.windowSafety === "number" && cfg.auto.windowSafety > 0 && cfg.auto.windowSafety <= 1) ? cfg.auto.windowSafety : 0.8;
+  return est + maxTokens <= Math.floor(w * safety);
+}
+function maxServableWindow(models) {
+  let max = 0;
+  for (const m of models) { const w = windowFor(m); if (w && w > max) max = w; }
+  return max;
+}
+function promptTooLargeMessage(est, maxWindow) {
+  return `router: prompt too large for every lane (estimated ~${est} tokens vs largest window ${maxWindow || "?"}). No fallback can serve this request - compact or restart the client session.`;
+}
+function heuristicModel(body, est) { // window+modality-aware successor of the old flash/glm fallback pick
+  const { image, video } = detectModalities(body && body.messages);
+  const fits = Object.keys(CANDIDATES).filter((k) => (!image || (CANDIDATES[k].mods || []).includes("image")) && (!video || (CANDIDATES[k].mods || []).includes("video")) && windowFits(k, est, effMaxTokens(body)));
+  if (!fits.length) return { model: null, tooLarge: { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) } };
+  let taskLen = 0; try { taskLen = JSON.stringify((body && body.messages) || []).length; } catch {}
+  const prefer = (image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3";
+  const pick = fits.includes(prefer) ? prefer : fits.slice().sort((a, b) => (windowFor(b) || 0) - (windowFor(a) || 0))[0];
+  return { model: pick };
+}
+
+async function decideAuto(body) {
+  const messages = safeMessages(body && body.messages);
+  const est = estimateTokens(body);
+  const task = messages.filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
-  const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")));
+  const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)));
+  if (!eligible.length) return { model: null, tooLarge: { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) } };
   // Real per-lane signals (PRD-005 meter): tokens burned today vs the configured
   // soft budget -> projectedRemainingRatio; recent failures penalize. The router
   // now avoids nearly-exhausted lanes instead of picking them and eating a 429 walk.
@@ -277,6 +364,7 @@ async function decideAuto(messages) {
   });
   const result = await client.systemOne({ state: {
     task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000),
+    estimatedPromptTokens: est, // context-window routing: the picker sees the size class it is routing for
     providerPoolsToday: pools,
     recentLadderEvents: USAGE.events.slice(0, 6).map((e) => e.text),
   }, questions: { route: q, difficulty: dq } });
@@ -1235,11 +1323,34 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
   const rsp = dialect === "responses";
   const edge = chat || rsp;
   const chain = [startModel, ...((CHAINS[startModel] || []).filter((m) => m !== startModel))];
+  // Context-window routing: a hop whose window cannot fit the request can only
+  // fail upstream (input_too_large / ContextWindowExceeded) and poison the lane
+  // counters. Skip those hops up front; if NOTHING fits, reject with 400 - a
+  // 502 "all models exhausted" here would send the client into a retry loop no
+  // model can ever satisfy.
+  const est = estimateTokens(body);
+  const effMax = effMaxTokens(body);
+  const servable = [], skipped = [];
+  for (const m of chain) {
+    if (windowFits(m, est, effMax)) servable.push(m);
+    else skipped.push(m);
+  }
+  for (const m of skipped) {
+    console.log(`[ladder] ${m} skipped: est ${est} + ${effMax} out > window ${windowFor(m)}`);
+    meterEvent(`[ladder] ${m} skipped: est ${est} tokens > window ${windowFor(m)} (not a lane failure)`);
+  }
+  if (!servable.length) {
+    const msg = promptTooLargeMessage(est, maxServableWindow(chain));
+    console.log(`[ladder] ${startModel}: prompt too large for every lane (est ${est} tokens) - 400, zero upstream attempts`);
+    meterEvent(`[ladder] ${startModel}: prompt too large (est ${est} tokens) - 400 no walk`);
+    if (chat || rsp) return sendOpenAIError(res, 400, msg);
+    return sendInvalidRequest(res, msg);
+  }
   const wantStream = !!body.stream;
   let clientStreaming = false; // once client bytes flowed, a failed hop must NOT walk: it would
                                // writeHead an already-started response and kill the process.
-  for (let i = 0; i < chain.length; i++) {
-    const model = chain[i];
+  for (let i = 0; i < servable.length; i++) {
+    const model = servable[i];
     const c = CANDIDATES[model];
     const tag = routeTagFor(model, body._routeDifficulty || body._routeEffort); // tag carries difficulty (PRD-006 C) or client effort
     try {
@@ -1394,11 +1505,11 @@ async function handleChatCompletions(req, res, body) {
     startModel = "auto"; // absent / "auto" / unknown model -> auto (B-3)
   }
   if (startModel === "auto") {
-    try { const _p = await decideAuto(translated.messages); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+    try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
     catch (e) {
-      const t = JSON.stringify(translated.messages || []).toLowerCase();
-      const { image, video } = detectModalities(translated.messages);
-      startModel = (image || video) ? "glm-5.3-flash" : (t.length < 400 ? "glm-5.3-flash" : "glm-5.3");
+      const _h = heuristicModel(translated, estimateTokens(translated));
+      if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+      startModel = _h.model;
       console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
     }
   }
@@ -1422,11 +1533,11 @@ async function handleResponses(req, res, body) {
   translated._routeEffort = effort; // PRD-004: rides the route tag
   let startModel = checked.passthrough ? "auto" : checked.model;
   if (startModel === "auto") {
-    try { const _p = await decideAuto(translated.messages); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+    try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
     catch (e) {
-      const t = JSON.stringify(translated.messages || []).toLowerCase();
-      const { image, video } = detectModalities(translated.messages);
-      startModel = (image || video) ? "glm-5.3-flash" : (t.length < 400 ? "glm-5.3-flash" : "glm-5.3");
+      const _h = heuristicModel(translated, estimateTokens(translated));
+      if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+      startModel = _h.model;
       console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
     }
   }
@@ -1554,11 +1665,11 @@ function handleRequest(req, res) {
     let startModel = parsed.model;
     try {
       if (startModel === "auto") {
-        try { const _p = await decideAuto(parsed.messages); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
+        try { const _p = await decideAuto(parsed); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
         catch (e) {
-          const t = JSON.stringify(parsed.messages || []).toLowerCase();
-          const { image, video } = detectModalities(parsed.messages);
-          startModel = (image || video) ? "glm-5.3-flash" : (t.length < 400 ? "glm-5.3-flash" : "glm-5.3");
+          const _h = heuristicModel(parsed, estimateTokens(parsed));
+          if (_h.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+          startModel = _h.model;
           console.log(`[auto] fallback heuristic -> ${startModel} (${String(e.message).slice(0, 60)})`);
         }
       }

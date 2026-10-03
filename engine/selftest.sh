@@ -50,6 +50,18 @@ check "shape3 empty-body 400" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X
 check "shape3 no-auth 401" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST "$BASE/v1/messages" -H 'content-type: application/json' -d '{"model":"auto","messages":[]}')" "401"
 check "shape3 health" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$BASE/v1/health" -H "authorization: Bearer $KEY")" "200"
 
+# shape 4: oversized prompt rejected 400 BEFORE any upstream attempt (context-window routing).
+# 5M chars -> est ~1.25M tokens > every lane budget incl the grok 1M override: deterministic,
+# zero-cost, offline. A 502 here would mean window routing regressed to dead-walking.
+python3 -c "import json;print(json.dumps({'model':'glm-5.3','max_tokens':1024,'messages':[{'role':'user','content':'x'*5000000}]}))" > /tmp/belay-st4.json
+python3 -c "import json;print(json.dumps({'model':'auto','max_tokens':1024,'messages':[{'role':'user','content':'x'*5000000}]}))" > /tmp/belay-st4b.json
+S4A=$(curl -s -o /tmp/belay-st4a.body -w '%{http_code}' -m 20 -X POST "$BASE/v1/messages" -H "authorization: Bearer $KEY" -H 'content-type: application/json' --data-binary @/tmp/belay-st4.json)
+check "shape4 pinned-model 400" "$S4A" "400"
+check "shape4 pinned message" "$(grep -c 'too large for every lane' /tmp/belay-st4a.body)" "1"
+S4B=$(curl -s -o /tmp/belay-st4b.body -w '%{http_code}' -m 20 -X POST "$BASE/v1/messages" -H "authorization: Bearer $KEY" -H 'content-type: application/json' --data-binary @/tmp/belay-st4b.json)
+check "shape4 auto 400" "$S4B" "400"
+check "shape4 auto message" "$(grep -c 'too large for every lane' /tmp/belay-st4b.body)" "1"
+
 echo "-----"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

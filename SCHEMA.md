@@ -13,7 +13,8 @@ the last known good keeps serving.
 | `tailnetIp` | string | no | Tailscale IP to ALSO bind for tailnet access. **Empty/unset = loopback-only** (the bot posture). Never put another machine's IP here. |
 | `litellm` | object | no | `{host, port}` of a local LiteLLM for GLM lanes (optional module) |
 | `openrouterFallbacks` | string[] | no | model names substituted for the `@openrouter` chain placeholder (Hop 2) |
-| `candidates` | object | **yes** | map of model-name → `{class, mods[], lane}`; lane ∈ `gpt` \| `grok` \| `litellm`; mods ⊆ `text,image,video` |
+| `contextWindowOverrides` | object | no | map of model name -> context window in tokens (machine truth). Wins over `candidates.<name>.contextWindow` and the model-catalog `contextWindow`. Use it when a subscription's real limit sits below the catalog number (e.g. grok-4.7 catalog says 2M but live `input_too_large` at >1M), or for LiteLLM-internal fallback names the catalog does not carry. |
+| `candidates` | object | **yes** | map of model-name → `{class, mods[], lane}`; lane ∈ `gpt` \| `grok` \| `litellm`; mods ⊆ `text,image,video`; optional `contextWindow` (positive number, tokens) per candidate |
 | `chains` | object | no | model-name → ordered hop list (same names as candidates, plus `@openrouter`); the ladder walks this order on 429/401/5xx |
 | `images` | object | no | `{default, paidFallback, bestAlias[], grokPrefix}` for `/v1/images/generate` |
 | `auto` | object | no | `{question, maxTaskChars}` - the jev/TypeSafe systemOne routing prompt and task slice |
@@ -42,6 +43,7 @@ the last known good keeps serving.
 | `auto.question` | string | capability-first wording | The jev routing question. Default: capability is the constraint, cost the tiebreaker among capable models. |
 | `auto.laneBudgetTokens` | number | 500000 | Soft per-lane daily token budget. The engine feeds each candidate's real `projectedRemainingRatio` (tokens-today vs this budget) plus `recentFailures` to jev, so routing avoids nearly-exhausted lanes instead of walking 429s. |
 | `auto.maxTaskChars` | number | 2000 | Task slice sent to the routing decision. |
+| `auto.windowSafety` | number | 0.8 | Fraction of a lane's context window the router is willing to commit to one request (estimate + output budget). The margin absorbs chars-per-token estimation drift; requests above it are treated as not fitting the lane. |
 | `auto.fallbackMinTokens` | number | 2048 | Output-budget floor for `openrouter-*` fallback requests. Those models spend hidden reasoning tokens before content; small `max_tokens` values finish empty and read as failed hops. This floors the per-response GENERATION budget only - it never touches the context window (client-side, e.g. 1M) and never caps larger requests. |
 
 Difficulty: every `auto` request also asks jev to classify the task
@@ -49,6 +51,30 @@ Difficulty: every `auto` request also asks jev to classify the task
 carries it in-stream, e.g. `\u00b7 \ud83d\udca8flash:trivial \u00b7` vs
 `\u00b7 \ud83c\udf10glm:frontier \u00b7`, and the log line shows both:
 `[auto] typesafe -> glm-5.3 (frontier, 122ms)`.
+
+## Context-window routing
+
+A prompt larger than every lane's window cannot be rescued by any fallback:
+every hop rejects it (`input_too_large` / `ContextWindowExceeded`), the walk
+poisons lane failure counters, and the client sees a misleading 502 "all
+models exhausted" (fleet incident 2026-10-03: a >1M-token session dead-walked
+every chain for an afternoon). The engine therefore:
+
+1. Estimates the request size (text chars/4, images by decoded bytes with a
+   256-token floor, tool inputs JSON-counted) plus the client `max_tokens`
+   (assumed 4096 when omitted).
+2. Resolves each lane's window: `contextWindowOverrides` ->
+   `candidates.<name>.contextWindow` -> model-catalog `contextWindow` ->
+   unknown (no constraint, the previous behavior).
+3. A lane only joins a route or a ladder walk when `estimate + max_tokens <=
+   window * auto.windowSafety`. Skips log
+   `[ladder] <model> skipped: est N + M out > window W` and are NOT metered as
+   failures, so degraded-lane health stays honest.
+4. When nothing in the pool fits, the request is rejected immediately with
+   HTTP 400 `router: prompt too large for every lane (estimated ~N tokens vs
+   largest window W). No fallback can serve this request - compact or restart
+   the client session.` - zero upstream attempts, and the client gets a
+   non-retryable signal instead of a 502 retry loop.
 
 ## Per-candidate display fields
 
