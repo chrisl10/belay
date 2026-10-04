@@ -299,7 +299,12 @@ function promptTooLargeMessage(est, maxWindow) {
 function heuristicModel(body, est) { // window+modality-aware successor of the old flash/glm fallback pick
   const { image, video } = detectModalities(body && body.messages);
   const fits = Object.keys(CANDIDATES).filter((k) => (!image || (CANDIDATES[k].mods || []).includes("image")) && (!video || (CANDIDATES[k].mods || []).includes("video")) && windowFits(k, est, effMaxTokens(body)));
-  if (!fits.length) return { model: null, tooLarge: { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) } };
+  if (!fits.length) {
+    const tl = { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) };
+    console.log(`[auto] heuristic: prompt too large for every lane (est ${est} tokens) - 400 no walk`);
+    meterEvent(`[auto] heuristic: prompt too large (est ${est} tokens) - 400 no walk`);
+    return { model: null, tooLarge: tl };
+  }
   let taskLen = 0; try { taskLen = JSON.stringify((body && body.messages) || []).length; } catch {}
   const prefer = (image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3";
   const pick = fits.includes(prefer) ? prefer : fits.slice().sort((a, b) => (windowFor(b) || 0) - (windowFor(a) || 0))[0];
@@ -312,7 +317,11 @@ async function decideAuto(body) {
   const task = messages.filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
   const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)));
-  if (!eligible.length) return { model: null, tooLarge: { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) } };
+  if (!eligible.length) { // window routing: nothing fits, do not even spend the jev call
+    console.log(`[auto] prompt too large for every lane (est ${est} tokens) - 400 no walk`);
+    meterEvent(`[auto] prompt too large (est ${est} tokens) - 400 no walk`);
+    return { model: null, tooLarge: { est, maxWindow: maxServableWindow(Object.keys(CANDIDATES)) } };
+  }
   // Real per-lane signals (PRD-005 meter): tokens burned today vs the configured
   // soft budget -> projectedRemainingRatio; recent failures penalize. The router
   // now avoids nearly-exhausted lanes instead of picking them and eating a 429 walk.
@@ -411,12 +420,28 @@ function anthropicToOpenAI(body) {
 
 // ---------- SSE helpers: emit Anthropic event stream ----------
 function sseWrite(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+// Direct-lane keepalive: gpt/grok can think SILENTLY for many minutes on large
+// contexts (2026-10-03: "Request timed out" retry loops while the model sat in
+// reasoning emitting zero bytes). Pings put bytes on the wire so client idle
+// timers reset; they carry no content, so harnesses ignore them (anthropic
+// streams ping natively). Litellm lanes stay lazy-primed: empty streams there
+// must keep the ladder walkable, and prime-now would spend that card.
+const PING_MS = 20000;
+const DIRECT_LANE_IDLE_MS = 600000; // upstream socket idle timeout: 240s aborted silent thinking mid-flight
+function startKeepalivePings(res, pingMs) {
+  const write = () => { try { if (!res.writableEnded && !res.destroyed) res.write(`event: ping\ndata: {"type":"ping"}\n\n`); } catch {} };
+  const timer = setInterval(write, pingMs || PING_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  const stop = () => { try { clearInterval(timer); } catch {} };
+  try { res.on("close", stop); res.on("finish", stop); } catch {}
+  return stop;
+}
 // Open a message; optionally lead with a tag-only thinking block (route visibility),
 // then the text block. Returns block-index helpers for multi-block streams.
-function openAnthropicStream(res, model, tag, tagAlways) {
+function openAnthropicStream(res, model, tag, tagAlways, keepalive) {
   if (res.headersSent) { // never throw from event handlers: degrade to a dead stream
     console.log("[stream] open on already-started response - returning dead stream (walk-after-bytes escaped a guard)");
-    return { textIdx: -1, tagEmitted: true, primed: () => true, prime() {}, openBlock: () => -1, closeBlock() {}, closeAll() {} };
+    return { textIdx: -1, tagEmitted: true, primed: () => true, prime() {}, openBlock: () => -1, closeBlock() {}, closeAll() {}, stopPings() {} };
   }
   let tagEmitted = false;
   let next = 0;
@@ -442,7 +467,9 @@ function openAnthropicStream(res, model, tag, tagAlways) {
   };
   // text block opens lazily on the first text delta - an empty text block
   // (start+stop, no deltas) reads as a malformed stream to clients.
-  return { textIdx: -1, get tagEmitted() { return tagEmitted; }, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); } };
+  let stopPings = () => {};
+  if (keepalive) { prime(); stopPings = startKeepalivePings(res); } // direct lanes: headers + message_start immediately, pings until content lands
+  return { textIdx: -1, get tagEmitted() { return tagEmitted; }, primed: () => primed, prime, openBlock: (cb) => { prime(); return openBlock(cb); }, closeBlock, closeAll: () => { for (const i of open.slice()) closeBlock(i); }, stopPings };
 }
 function emitSseError(res, message) {
   if (res.writableEnded) return;
@@ -467,8 +494,8 @@ const captureOn = process.env.BELAY_CAPTURE !== "0";
 // grok/openai-chat: openai chat SSE -> anthropic SSE. Maps streaming tool_calls
 // deltas to tool_use blocks and reasoning_content to thinking blocks (PRD-003/004);
 // leads with the route tag so the user sees who served, in-stream.
-function pipeGrokSSE(upRes, res, model, tag, onEmpty) {
-  const s = openAnthropicStream(res, model, tag, true);
+function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive) {
+  const s = openAnthropicStream(res, model, tag, true, keepalive);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
   // anthropic blocks are sequential: opening one kind closes the other; blocks REOPEN
@@ -531,6 +558,7 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty) {
 // client - Claude Code parses arguments and dies with a malformed-stream error.
 // In that case emit an SSE error event so the client retries the turn cleanly.
 function finishStream(res, usage, finish, s, toolEmitted, abnormal, onEmpty) {
+  if (s && s.stopPings) { try { s.stopPings(); } catch {} } // keepalive card is spent the moment the stream terminates
   const tools = s.toolArgs || new Map();
   for (const [, args] of tools) {
     if (typeof args === "string" && args.trim()) {
@@ -547,8 +575,8 @@ function finishStream(res, usage, finish, s, toolEmitted, abnormal, onEmpty) {
   }
   anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage);
 }
-function pipeGPTSSE(upRes, res, model, tag, onEmpty) {
-  const s = openAnthropicStream(res, model, tag, true);
+function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive) {
+  const s = openAnthropicStream(res, model, tag, true, keepalive);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
   let toolEmitted = false;
@@ -671,6 +699,9 @@ function pipeAnthropicToOpenAIChatSSE(upRes, res, model, reqModel) {
         if (j.delta && typeof j.delta.stop_reason === "string" && j.delta.stop_reason) finishReason = STOP_TO_FINISH[j.delta.stop_reason] || "stop";
         const u = j.usage || {};
         if (typeof u.output_tokens === "number") usage.completion_tokens = u.output_tokens;
+      } else if (t === "ping") { // direct-lane keepalive: bytes on the wire, ignored by data:-line parsers
+        prime();
+        if (!res.writableEnded) res.write(": keepalive\n\n");
       } else if (t === "error") { // upstream failed mid-stream: surface in-dialect, never silently
         prime();
         if (!res.writableEnded) {
@@ -1087,6 +1118,9 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
         if (j.delta && typeof j.delta.stop_reason === "string" && j.delta.stop_reason) stopReason = j.delta.stop_reason;
         const u = j.usage || {};
         if (typeof u.output_tokens === "number") usage.output_tokens = u.output_tokens;
+      } else if (t === "ping") { // direct-lane keepalive: bytes on the wire, ignored by data:-line parsers
+        prime();
+        if (!res.writableEnded) res.write(": keepalive\n\n");
       } else if (t === "error") { // upstream failed mid-stream: surface as response.failed
         prime();
         if (!res.writableEnded) {
@@ -1114,7 +1148,7 @@ async function serveGrok(model, body, res, tag) {
   const ob = anthropicToOpenAI(body);
   ob.model = "grok-4.7";
   const wantStream = !!ob.stream;
-  let r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
+  let r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
   if ((r.status === 401 || r.status === 403) && !r.stream) { // credential rot: refresh beside-config script (60s exec cooldown), re-read token, retry once
     const now = Date.now();
     if (now - grokRefreshAt > 60000) {
@@ -1126,10 +1160,10 @@ async function serveGrok(model, body, res, tag) {
     const nt = tokens();
     if (nt.grok && nt.grok !== t.grok) {
       t = nt;
-      r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), 240000, (status) => wantStream && status === 200);
+      r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
     }
   }
-  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag); return { streamed: true }; }
+  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag, undefined, true); return { streamed: true }; }
   if (isFail(r.status)) throw new Error(`grok ${r.status}: ${r.body.slice(0, 120)}`);
   return { kind: "anthropic", body: openAIToAnthropic("grok-4.7", JSON.parse(r.body), model) };
 }
@@ -1173,9 +1207,9 @@ async function serveGPT(model, body, res, tag) {
   const r = await postUpstream("chatgpt.com", "/backend-api/codex/responses", {
     "Authorization": "Bearer " + t.gpt, "chatgpt-account-id": t.acct, "content-type": "application/json",
     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.156.1", "OpenAI-Beta": "responses=experimental",
-  }, JSON.stringify(ob), 240000, (status) => status === 200);
+  }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => status === 200);
   if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 200)}`);
-  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
+  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag, undefined, true); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
   if (!r.stream) throw new Error(`gpt ${r.status}: expected event stream`);
   // non-stream client: assemble the JSON response from the upstream SSE events
   const assembled = await new Promise((resolve, reject) => {

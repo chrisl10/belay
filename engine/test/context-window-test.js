@@ -28,9 +28,9 @@ const fixtureCatalog = {
   "gpt-6.1-sol": { contextWindow: 1000000 },
 };
 
-const h = new Function("cfg", "CANDIDATES", "CATALOG", "detectModalities",
+const h = new Function("cfg", "CANDIDATES", "CATALOG", "detectModalities", "meterEvent",
   block + "\nreturn { estimateTokens, windowFor, effMaxTokens, windowFits, maxServableWindow, promptTooLargeMessage, heuristicModel };"
-)(fixtureCfg, fixtureCandidates, fixtureCatalog, () => ({ image: false, video: false }));
+)(fixtureCfg, fixtureCandidates, fixtureCatalog, () => ({ image: false, video: false }), () => {});
 
 let pass = 0, fail = 0;
 const check = (name, got, want) => {
