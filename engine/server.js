@@ -281,7 +281,7 @@ function windowFor(model) {
 }
 function effMaxTokens(body) {
   if (body && typeof body.max_tokens === "number" && body.max_tokens > 0) return body.max_tokens;
-  return 4096; // assume a real agent output budget when the client omits it
+  return 16384; // reasoning-era agent output budget when the client omits it (PRD-001 reopen 2026-10-06: 4096 starved thinking lanes)
 }
 function windowFits(model, est, maxTokens) {
   const w = windowFor(model);
@@ -883,7 +883,7 @@ function openaiChatToAnthropic(body) {
   }
   const out = {
     messages: msgs.length ? msgs : [{ role: "user", content: "" }],
-    max_tokens: (typeof body.max_tokens === "number" && body.max_tokens > 0) ? body.max_tokens : 1024,
+    max_tokens: (typeof body.max_tokens === "number" && body.max_tokens > 0) ? body.max_tokens : 16384, // client cap verbatim; reasoning-era default (PRD-001 reopen 2026-10-06)
     stream: !!body.stream,
   };
   if (systemParts.length) out.system = systemParts.join("\n\n");
@@ -1007,7 +1007,7 @@ function responsesToAnthropic(body) {
   }
   const out = {
     messages: msgs.length ? msgs : [{ role: "user", content: "" }],
-    max_tokens: (typeof body.max_output_tokens === "number" && body.max_output_tokens > 0) ? body.max_output_tokens : 1024,
+    max_tokens: (typeof body.max_output_tokens === "number" && body.max_output_tokens > 0) ? body.max_output_tokens : 16384, // client cap verbatim; reasoning-era default (PRD-001 reopen 2026-10-06)
     stream: !!body.stream,
   };
   if (systemParts.length) out.system = systemParts.join("\n\n");
@@ -1329,6 +1329,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   const ob = anthropicToOpenAI(body); // maps tools + tool history (PRD-001c)
   ob.model = model;
   ob.stream = !!wantStream;
+  if (ob.stream) ob.stream_options = { include_usage: true }; // PRD-001 reopen (2026-10-06): litellm emits no usage chunk without this, so cached_tokens never reached streaming clients
   ob.reasoning_effort = (cfg.litellm && cfg.litellm.reasoningEffort) || "low"; // z.ai coding models think unboundedly without it
   const fbMin = (cfg.auto && cfg.auto.fallbackMinTokens) || 2048; // OR fallbacks reason heavily; small generation budgets arrive EMPTY and read as failed hops. Output budget floor only - never touches context window.
   if (String(model).startsWith("openrouter") && ob.max_tokens < fbMin) ob.max_tokens = fbMin;
