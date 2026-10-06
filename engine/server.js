@@ -312,6 +312,47 @@ function heuristicModel(body, est) { // window+modality-aware successor of the o
   return { model: pick };
 }
 
+// ---------- PRD-001: session-sticky lanes + honest usage carryover ----------
+// Codex-style clients resend the full conversation every turn, so the prefix
+// (system + first message) is stable per session while turns append at the
+// tail. Pin the first-turn lane pick per fingerprint: turn 2+ reuses the warm
+// prompt cache instead of re-running the picker, and a ladder walk re-pins the
+// lane that actually served. R2.2: the original lane returns only when a NEW
+// session maps to it (entry replaced per fingerprint; no mid-session un-pin).
+// Entries idle out after 2h (lazy sweep on lookup keeps the map bounded).
+const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+const sessionAffinity = new Map(); // fingerprint -> { model, lastRealPromptTokens, lastSeenMs }
+function sessionFingerprint(body) {
+  let sys = "";
+  const s = body && body.system;
+  if (typeof s === "string") sys = s;
+  else if (s != null) { try { sys = JSON.stringify(s); } catch {} }
+  let content = "";
+  const first = safeMessages(body && body.messages)[0];
+  if (first && typeof first === "object" && first.content != null) { try { content = JSON.stringify(first.content); } catch {} }
+  return crypto.createHash("sha256").update(sys.slice(0, 1024) + content.slice(0, 1024)).digest("hex");
+}
+function stickyLookup(fp) {
+  const now = Date.now();
+  for (const [k, v] of sessionAffinity) if (now - v.lastSeenMs > SESSION_IDLE_MS) sessionAffinity.delete(k);
+  return sessionAffinity.get(fp) || null;
+}
+function stickyPin(fp, h8, model, how) {
+  sessionAffinity.set(fp, { model, lastRealPromptTokens: 0, lastSeenMs: Date.now() });
+  console.log(`[sticky] session ${h8} pinned -> ${model} (${how})`);
+}
+// R3.1/R3.3: prefer the session's last REAL prompt size (+ one turn of growth)
+// over chars/4 when sizing windows and message_start estimates.
+function estimateForSession(body, fp) {
+  const pinned = fp && stickyLookup(fp);
+  if (pinned && typeof pinned.lastRealPromptTokens === "number" && pinned.lastRealPromptTokens > 0) {
+    const est = pinned.lastRealPromptTokens + 4096;
+    console.log(`[window] session ${String(fp).slice(0, 8)} est ${est} = real ${pinned.lastRealPromptTokens} + 4096 (carryover)`);
+    return est;
+  }
+  return estimateTokens(body);
+}
+
 async function decideAuto(body) {
   const messages = safeMessages(body && body.messages);
   const est = estimateTokens(body);
@@ -457,7 +498,7 @@ function openAnthropicStream(res, model, tag, tagAlways, keepalive, estInput) {
     if (primed) return;
     primed = true;
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estInput || 0, output_tokens: 0 } } });
+    sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estInput || 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }); // cache values unknown at open; real ones ride message_delta
     if (tag && tagAlways) {
       const i = openBlock({ type: "thinking", thinking: "" });
       sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: tag + "\n" } });
@@ -483,7 +524,7 @@ function emitSseError(res, message) {
 }
 
 function anthropicStreamEnd(res, stopReason, usage) {
-  sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: (usage && usage.output_tokens) || 0 } });
+  sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: (usage && usage.output_tokens) || 0, cache_read_input_tokens: (usage && usage.cache_read_input_tokens) || 0, cache_creation_input_tokens: (usage && usage.cache_creation_input_tokens) || 0 } }); // PRD-001 R1: upstream cache hit data rides the terminal usage; zeros when unreported, never fabricated
   sseWrite(res, "message_stop", { type: "message_stop" });
   res.end();
 }
@@ -495,9 +536,9 @@ const captureOn = process.env.BELAY_CAPTURE !== "0";
 // grok/openai-chat: openai chat SSE -> anthropic SSE. Maps streaming tool_calls
 // deltas to tool_use blocks and reasoning_content to thinking blocks (PRD-003/004);
 // leads with the route tag so the user sees who served, in-stream.
-function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
+function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput, onUsage) {
   const s = openAnthropicStream(res, model, tag, true, keepalive, estInput);
-  let buf = "", usage = { output_tokens: 0 };
+  let buf = "", usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   let thinkIdx = -1;
   // anthropic blocks are sequential: opening one kind closes the other; blocks REOPEN
   // as the upstream alternates (glm streams reasoning first, then content).
@@ -541,7 +582,10 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
           const args = (tc.function && typeof tc.function.arguments === "string") ? tc.function.arguments : "";
           if (args) { usage.output_tokens++; (s.toolArgs || (s.toolArgs = new Map())).set(key, (s.toolArgs.get(key) || "") + args); sseWrite(res, "content_block_delta", { type: "content_block_delta", index: bIdx, delta: { type: "input_json_delta", partial_json: args } }); }
         }
+        if (j.usage && j.usage.prompt_tokens) usage.input_tokens = j.usage.prompt_tokens; // PRD-001 R1/R3: prompt tokens were dropped here; carry them + the cache hit data
+        if (j.usage && j.usage.prompt_tokens_details && typeof j.usage.prompt_tokens_details.cached_tokens === "number") usage.cache_read_input_tokens = j.usage.prompt_tokens_details.cached_tokens;
         if (j.usage && j.usage.completion_tokens) usage.output_tokens = j.usage.completion_tokens;
+        if (onUsage && usage.input_tokens > 0) onUsage(usage); // PRD-001 R3: real prompt size feeds the session's next-turn estimate
       } catch {}
     }
   });
@@ -620,7 +664,7 @@ function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
         if (t === "response.completed" || t === "response.incomplete") {
           const u = (j.response || {}).usage || {};
           closeThink(); s.closeAll();
-          anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { output_tokens: u.output_tokens || usage.output_tokens });
+          anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || usage.output_tokens, cache_read_input_tokens: ((u.input_tokens_details || {}).cached_tokens) || 0, cache_creation_input_tokens: 0 }); // PRD-001 R1: responses-native cached_tokens carried, not dropped
           return;
         }
         if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); return; }
@@ -767,7 +811,7 @@ function openAIToAnthropic(model, o, reqModel) {
     blocks.push({ type: "tool_use", id: (typeof tc.id === "string" && tc.id) || ("toolu_router_" + blocks.length), name: fn.name, input });
   }
   const stop = ch.finish_reason === "tool_calls" ? "tool_use" : (ch.finish_reason === "length" ? "max_tokens" : "end_turn");
-  return { id: o.id || "msg_router", type: "message", role: "assistant", model: reqModel || model, content: blocks, stop_reason: stop, stop_sequence: null, usage: { input_tokens: (o.usage || {}).prompt_tokens || 0, output_tokens: (o.usage || {}).completion_tokens || 0 } };
+  return { id: o.id || "msg_router", type: "message", role: "assistant", model: reqModel || model, content: blocks, stop_reason: stop, stop_sequence: null, usage: { input_tokens: (o.usage || {}).prompt_tokens || 0, output_tokens: (o.usage || {}).completion_tokens || 0, cache_read_input_tokens: (((o.usage || {}).prompt_tokens_details || {}).cached_tokens) || 0, cache_creation_input_tokens: 0 } }; // PRD-001 R1: upstream prompt cache hits surfaced, creation unreported by this lane
 }
 
 // ---------- PRD-001b B-2/B-4/B-5: openai chat <-> anthropic translators ----------
@@ -1019,7 +1063,7 @@ function anthropicToResponses(model, body, reqModel) {
     status: (body && body.stop_reason === "max_tokens") ? "incomplete" : "completed",
     model: reqModel || model,
     output,
-    usage: { input_tokens: inputT, output_tokens: outputT, total_tokens: inputT + outputT },
+    usage: { input_tokens: inputT, output_tokens: outputT, total_tokens: inputT + outputT, input_tokens_details: { cached_tokens: typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : 0 } }, // PRD-001 R1: cache transparency in the responses dialect
   };
 }
 
@@ -1042,7 +1086,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
   let buf = "";
   let ended = false;
   let outIdx = -1, openKind = "", openItem = null, thinkText = "", toolArgs = "";
-  const usage = { input_tokens: 0, output_tokens: 0 };
+  const usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 };
   let stopReason = "";
   const closeItem = () => {
     if (openItem) {
@@ -1064,7 +1108,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
     const incomplete = stopReason === "max_tokens";
     const t = incomplete ? "response.incomplete" : "response.completed";
     const inTok = usage.input_tokens || estInput || 0; // usage transparency: codex reads input_tokens to drive auto-compaction; synthetic anthropic message_start reports 0
-    const u = { input_tokens: inTok, output_tokens: usage.output_tokens, total_tokens: inTok + usage.output_tokens };
+    const u = { input_tokens: inTok, output_tokens: usage.output_tokens, total_tokens: inTok + usage.output_tokens, input_tokens_details: { cached_tokens: usage.cache_read_input_tokens || 0 } }; // PRD-001 R1/R3.2: real -> carryover est -> estimate, cache hits surfaced
     sseWrite(res, t, { type: t, response: responseObj(incomplete ? "incomplete" : "completed", u) });
     res.end();
   };
@@ -1084,6 +1128,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
       if (t === "message_start") {
         const u = (j.message || {}).usage || {};
         if (typeof u.input_tokens === "number") usage.input_tokens = u.input_tokens;
+        if (typeof u.cache_read_input_tokens === "number") usage.cache_read_input_tokens = u.cache_read_input_tokens;
       } else if (t === "content_block_start") {
         closeItem(); // anthropic content blocks are strictly sequential, never nested
         const cb = j.content_block || {};
@@ -1120,6 +1165,8 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
         if (j.delta && typeof j.delta.stop_reason === "string" && j.delta.stop_reason) stopReason = j.delta.stop_reason;
         const u = j.usage || {};
         if (typeof u.output_tokens === "number") usage.output_tokens = u.output_tokens;
+        if (typeof u.input_tokens === "number") usage.input_tokens = u.input_tokens; // R3.2: upstream real beats the message_start estimate when the lane captured it
+        if (typeof u.cache_read_input_tokens === "number") usage.cache_read_input_tokens = u.cache_read_input_tokens; // PRD-001 R1: cache hit data rides the terminal usage
       } else if (t === "ping") { // direct-lane keepalive: bytes on the wire, ignored by data:-line parsers
         prime();
         if (!res.writableEnded) res.write(": keepalive\n\n");
@@ -1165,7 +1212,7 @@ async function serveGrok(model, body, res, tag) {
       r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
     }
   }
-  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag, undefined, true, estimateTokens(body)); return { streamed: true }; }
+  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag, undefined, true, body._estTokens || estimateTokens(body)); return { streamed: true }; }
   if (isFail(r.status)) throw new Error(`grok ${r.status}: ${r.body.slice(0, 120)}`);
   return { kind: "anthropic", body: openAIToAnthropic("grok-4.7", JSON.parse(r.body), model) };
 }
@@ -1211,7 +1258,7 @@ async function serveGPT(model, body, res, tag) {
     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.156.1", "OpenAI-Beta": "responses=experimental",
   }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => status === 200);
   if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 200)}`);
-  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag, undefined, true, estimateTokens(body)); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
+  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag, undefined, true, body._estTokens || estimateTokens(body)); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
   if (!r.stream) throw new Error(`gpt ${r.status}: expected event stream`);
   // non-stream client: assemble the JSON response from the upstream SSE events
   const assembled = await new Promise((resolve, reject) => {
@@ -1233,7 +1280,7 @@ async function serveGPT(model, body, res, tag) {
         if (tt === "response.function_call_arguments.delta" && curFn && typeof j.delta === "string") curFn.args += j.delta;
         if (tt === "response.completed" || tt === "response.incomplete") {
           const u = (j.response || {}).usage || {};
-          usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+          usage = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0, cache_read_input_tokens: ((u.input_tokens_details || {}).cached_tokens) || 0, cache_creation_input_tokens: 0 };
           stop = tt === "response.incomplete" ? "max_tokens" : (fns.length ? "tool_use" : "end_turn");
         }
         if (tt === "error" || tt === "response.failed") { reject(new Error("gpt stream error: " + JSON.stringify(j).slice(0, 100))); return; }
@@ -1302,10 +1349,10 @@ function litellmLane(req, res, body, model, wantStream, opts) {
         const onEmpty = () => { empty = true; };
         if (dialect) { // openai-chat SSE -> anthropic SSE (sink) -> client dialect SSE
           const sink = anthropicSink();
-          pipeGrokSSE(ur, sink, model, tag, onEmpty, undefined, estimateTokens(body));
-          (dialect === "responses" ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, estimateTokens(body));
+          pipeGrokSSE(ur, sink, model, tag, onEmpty, undefined, body._estTokens || estimateTokens(body), opts && opts.onUsage);
+          (dialect === "responses" ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, body._estTokens || estimateTokens(body));
         } else {
-          pipeGrokSSE(ur, res, model, tag, onEmpty, undefined, estimateTokens(body)); // anthropic client: openai-chat SSE -> anthropic SSE directly
+          pipeGrokSSE(ur, res, model, tag, onEmpty, undefined, body._estTokens || estimateTokens(body), opts && opts.onUsage); // anthropic client: openai-chat SSE -> anthropic SSE directly
         }
         ur.on("end", () => {
           if (empty) { meter(model, "fail"); meterEvent(`[ladder] ${model} failed: empty stream`); reject(new Error("litellm empty stream")); return; }
@@ -1326,6 +1373,7 @@ function litellmLane(req, res, body, model, wantStream, opts) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(dialect === "responses" ? anthropicToResponses(model, anth, reqModel) : (dialect === "openai-chat" ? anthropicToOpenAIChat(model, anth, reqModel) : anth)));
         meter(model, "ok", { in: (anth.usage || {}).input_tokens, out: (anth.usage || {}).output_tokens });
+        if (opts && opts.onUsage) opts.onUsage(anth.usage); // PRD-001 R3: real prompt tokens feed the session's next-turn estimate
         resolve({ tokens: { in: (anth.usage || {}).input_tokens, out: (anth.usage || {}).output_tokens } });
       });
     });
@@ -1351,7 +1399,7 @@ function proxyToLiteLLM(req, res, bodyBuf, modelOverride) {
   up.end(buf);
 }
 
-async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
+async function serveWithLadder(req, res, body, startModel, dialect, reqModel, sessionCtx) {
   // dialect "openai-chat" (PRD-001b) / "responses" (PRD-001c): lanes stay anthropic-native; their output
   // is translated at the edge - non-stream bodies via the dialect's JSON translator, streams via an
   // anthropicSink + the dialect's SSE piper.
@@ -1364,9 +1412,26 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
   // counters. Skip those hops up front; if NOTHING fits, reject with 400 - a
   // 502 "all models exhausted" here would send the client into a retry loop no
   // model can ever satisfy.
-  const est = estimateTokens(body);
+  const est = estimateForSession(body, sessionCtx && sessionCtx.fp); // PRD-001 R3.1: the session's real prior usage sizes the window, not chars/4
+  body._estTokens = est; // rides to the serveGrok/serveGPT/litellmLane estimate call sites (same pattern as _routeDifficulty)
+  // PRD-001 R2/R3: session bookkeeping. noteUsage records real prompt tokens as
+  // lanes report them; stickyServed re-pins the lane that actually served and
+  // logs the walk (last hop error text, "breaker", or "window").
+  const noteUsage = (u) => {
+    if (!sessionCtx || !sessionCtx.fp) return;
+    if (!u || typeof u.input_tokens !== "number" || !(u.input_tokens > 0)) return;
+    const prev = sessionAffinity.get(sessionCtx.fp) || {};
+    sessionAffinity.set(sessionCtx.fp, { model: prev.model || sessionCtx.pinnedModel, lastRealPromptTokens: u.input_tokens, lastSeenMs: Date.now() });
+  };
+  const stickyServed = (servedModel, reason) => {
+    if (!sessionCtx || !sessionCtx.fp) return;
+    const prev = sessionAffinity.get(sessionCtx.fp) || {};
+    if (sessionCtx.pinnedModel && servedModel !== sessionCtx.pinnedModel) console.log(`[sticky] session ${sessionCtx.h8} walked ${sessionCtx.pinnedModel} -> ${servedModel}: ${reason || "ladder"}`);
+    sessionAffinity.set(sessionCtx.fp, { model: servedModel, lastRealPromptTokens: prev.lastRealPromptTokens || 0, lastSeenMs: Date.now() });
+  };
   const effMax = effMaxTokens(body);
   const servable = [], skipped = [];
+  let walkReason = "";
   for (const m of chain) {
     if (windowFits(m, est, effMax)) servable.push(m);
     else skipped.push(m);
@@ -1374,6 +1439,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
   for (const m of skipped) {
     console.log(`[ladder] ${m} skipped: est ${est} + ${effMax} out > window ${windowFor(m)}`);
     meterEvent(`[ladder] ${m} skipped: est ${est} tokens > window ${windowFor(m)} (not a lane failure)`);
+    walkReason = "window";
   }
   if (!servable.length) {
     const msg = promptTooLargeMessage(est, maxServableWindow(chain));
@@ -1389,7 +1455,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
     const model = servable[i];
     const c = CANDIDATES[model];
     const tag = routeTagFor(model, body._routeDifficulty || body._routeEffort); // tag carries difficulty (PRD-006 C) or client effort
-    if (laneQuotaCooldown[c && c.lane] > Date.now()) { meterEvent(`[breaker] ${model} skipped: lane ${c.lane} in quota cooldown`); continue; }
+    if (laneQuotaCooldown[c && c.lane] > Date.now()) { meterEvent(`[breaker] ${model} skipped: lane ${c.lane} in quota cooldown`); console.log(`[breaker] ${model} skipped: lane ${c.lane} in quota cooldown`); walkReason = "breaker"; continue; }
     try {
       if (c && c.lane === "grok") {
         const sink = edge && wantStream ? anthropicSink() : res;
@@ -1399,6 +1465,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, est);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
+          stickyServed(model, walkReason);
           return;
         }
         res.writeHead(200, { "content-type": "application/json" });
@@ -1406,6 +1473,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         const _u = (out.body && out.body.usage) || {};
         meter(model, "ok", { in: _u.input_tokens, out: _u.output_tokens }); meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
         console.log(`[ladder] ${chain[0]} -> served by ${model}`);
+        noteUsage(_u); stickyServed(model, walkReason);
         return;
       }
       if (c && c.lane === "gpt") {
@@ -1416,6 +1484,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
           if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, est);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
+          stickyServed(model, walkReason);
           return;
         }
         res.writeHead(200, { "content-type": "application/json" });
@@ -1423,18 +1492,21 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         const _u = (out.body && out.body.usage) || {};
         meter(model, "ok", { in: _u.input_tokens, out: _u.output_tokens }); meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
         console.log(`[ladder] ${chain[0]} -> served by ${model}`);
+        noteUsage(_u); stickyServed(model, walkReason);
         return;
       }
-      const _opts = edge ? { dialect, reqModel, tag, streamed: false } : { tag, streamed: false };
+      const _opts = edge ? { dialect, reqModel, tag, streamed: false, onUsage: noteUsage } : { tag, streamed: false, onUsage: noteUsage };
       const _r = await litellmLane(req, res, body, model, wantStream, _opts);
       if (_opts.streamed) clientStreaming = true;
       meterEvent(`[ladder] ${chain[0]} -> served by ${model}`);
       console.log(`[ladder] ${chain[0]} -> served by ${model}`);
+      stickyServed(model, walkReason);
       return;
     } catch (e) {
       if (c && (c.lane === "grok" || c.lane === "gpt")) meter(model, "fail"); // litellm lane meters itself
       if (c && /usage_limit_reached/.test(errText(e))) { const until = Date.now() + 10 * 60 * 1000; if ((laneQuotaCooldown[c.lane] || 0) < until) { laneQuotaCooldown[c.lane] = until; console.log(`[breaker] lane ${c.lane} quota-exhausted: cooling 10m`); } }
       meterEvent(`[ladder] ${model} failed: ${errText(e).slice(0, 90)}`);
+      walkReason = errText(e).slice(0, 90); // PRD-001 R2: the walk log carries the last hop's failure text
       if (clientStreaming) { // PRD-005: client bytes already flowed; the lane closed the client stream
         console.log(`[ladder] ${chain[0]} -> stream aborted mid-flight (no walk; client stream owned by lane)`);
         return;
@@ -1538,21 +1610,36 @@ async function handleChatCompletions(req, res, body) {
   const translated = openaiChatToAnthropic(body); // pure, crash-guarded translation (B-2/B-4)
   if (typeof body.reasoning_effort === "string") translated._routeEffort = body.reasoning_effort; // PRD-004
   const reqModel = (typeof body.model === "string" && body.model.trim()) ? body.model.trim() : "auto";
-  let startModel = reqModel;
-  if (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) {
-    startModel = "auto"; // absent / "auto" / unknown model -> auto (B-3)
-  }
-  if (startModel === "auto") {
-    try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
-    catch (e) {
-      const _h = heuristicModel(translated, estimateTokens(translated));
-      if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
-      startModel = _h.model;
-      console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
+  // PRD-001 R2: session-sticky entry. A pinned session reuses its lane (warm
+  // prompt cache) and skips the picker entirely; a fresh session pins whatever
+  // this request resolves to, auto or explicit.
+  const _fp = sessionFingerprint(translated);
+  const _h8 = _fp.slice(0, 8);
+  const _pinned = stickyLookup(_fp);
+  let startModel;
+  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+    console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
+    startModel = _pinned.model;
+  } else {
+    startModel = reqModel;
+    if (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) {
+      startModel = "auto"; // absent / "auto" / unknown model -> auto (B-3)
+    }
+    if (startModel === "auto") {
+      try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+      catch (e) {
+        const _h = heuristicModel(translated, estimateTokens(translated));
+        if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+        startModel = _h.model;
+        console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
+      }
+      stickyPin(_fp, _h8, startModel, "auto");
+    } else {
+      stickyPin(_fp, _h8, startModel, "explicit");
     }
   }
   // C-7 ladder contract applies to the chat dialect too: no direct short-circuit.
-  return serveWithLadder(req, res, translated, startModel, "openai-chat", reqModel);
+  return serveWithLadder(req, res, translated, startModel, "openai-chat", reqModel, { fp: _fp, h8: _h8, pinnedModel: startModel });
 }
 
 // ---------- PRD-001c C-1..C-7: POST /v1/responses (openai responses dialect inbound) ----------
@@ -1569,19 +1656,33 @@ async function handleResponses(req, res, body) {
   const effort = (body.reasoning && typeof body.reasoning === "object" && typeof body.reasoning.effort === "string") ? body.reasoning.effort : "";
   if (effort) console.log(`[responses] reasoning effort=${effort} (informational)`); // C-3: recorded for ladder logs
   translated._routeEffort = effort; // PRD-004: rides the route tag
-  let startModel = checked.passthrough ? "auto" : checked.model;
-  if (startModel === "auto") {
-    try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
-    catch (e) {
-      const _h = heuristicModel(translated, estimateTokens(translated));
-      if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
-      startModel = _h.model;
-      console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
+  // PRD-001 R2: session-sticky entry (see handleChatCompletions); the fingerprint
+  // rides the translated prefix so appended turns keep the same session.
+  const _fp = sessionFingerprint(translated);
+  const _h8 = _fp.slice(0, 8);
+  const _pinned = stickyLookup(_fp);
+  let startModel;
+  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+    console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
+    startModel = _pinned.model;
+  } else {
+    startModel = checked.passthrough ? "auto" : checked.model;
+    if (startModel === "auto") {
+      try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+      catch (e) {
+        const _h = heuristicModel(translated, estimateTokens(translated));
+        if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+        startModel = _h.model;
+        console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
+      }
+      stickyPin(_fp, _h8, startModel, "auto");
+    } else {
+      stickyPin(_fp, _h8, startModel, "explicit");
     }
   }
   // C-7: every pick rides serveWithLadder so a 429 on any lane (incl. litellm) walks the chain
   // instead of failing the request - the direct short-circuit broke the owner ladder contract.
-  return serveWithLadder(req, res, translated, startModel, "responses", reqModel);
+  return serveWithLadder(req, res, translated, startModel, "responses", reqModel, { fp: _fp, h8: _h8, pinnedModel: startModel });
 }
 
 function handleRequest(req, res) {
@@ -1701,14 +1802,27 @@ function handleRequest(req, res) {
     if (!checked.ok) return sendInvalidRequest(res, checked.message);
     if (checked.passthrough) return proxyToLiteLLM(req, res, bodyBuf);
     let startModel = parsed.model;
+    // PRD-001 R2: session-sticky entry (see handleChatCompletions); passthrough
+    // models returned above never touch the affinity map.
+    const _fp = sessionFingerprint(parsed);
+    const _h8 = _fp.slice(0, 8);
+    const _pinned = stickyLookup(_fp);
     try {
-      if (startModel === "auto") {
-        try { const _p = await decideAuto(parsed); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
-        catch (e) {
-          const _h = heuristicModel(parsed, estimateTokens(parsed));
-          if (_h.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
-          startModel = _h.model;
-          console.log(`[auto] fallback heuristic -> ${startModel} (${String(e.message).slice(0, 60)})`);
+      if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+        console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
+        startModel = _pinned.model;
+      } else {
+        if (startModel === "auto") {
+          try { const _p = await decideAuto(parsed); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
+          catch (e) {
+            const _h = heuristicModel(parsed, estimateTokens(parsed));
+            if (_h.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
+            startModel = _h.model;
+            console.log(`[auto] fallback heuristic -> ${startModel} (${String(e.message).slice(0, 60)})`);
+          }
+          stickyPin(_fp, _h8, startModel, "auto");
+        } else {
+          stickyPin(_fp, _h8, startModel, "explicit");
         }
       }
     } catch (e) {
@@ -1717,7 +1831,7 @@ function handleRequest(req, res) {
     }
     // litellm-lane picks also ride serveWithLadder (ladder contract); passthrough models
     // (unknown names) still proxy raw above.
-    return serveWithLadder(req, res, parsed, startModel);
+    return serveWithLadder(req, res, parsed, startModel, undefined, undefined, { fp: _fp, h8: _h8, pinnedModel: startModel });
   });
 }
 
