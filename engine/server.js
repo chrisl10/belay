@@ -19,6 +19,7 @@ const { TypeSafeClient, choice } = require("@typesafe-ai/sdk");
 const H = os.homedir();
 const CONFIG_PATH = process.env.BELAY_CONFIG || process.env.FABRIC_CONFIG || path.join(H, "belay", "belay.config.json");
 let cfg = null, cfgMtimeMs = 0, CANDIDATES = {}, OR = [], CHAINS = {};
+const laneQuotaCooldown = {}; // lane -> epoch ms; usage_limit_reached 429s cool the lane instead of re-attempting every request
 function validateConfig(c) {
   if (!c || typeof c !== "object" || Array.isArray(c)) return "config: not an object";
   if (!c.candidates || typeof c.candidates !== "object" || Array.isArray(c.candidates) || !Object.keys(c.candidates).length) return "candidates: missing or empty";
@@ -438,7 +439,7 @@ function startKeepalivePings(res, pingMs) {
 }
 // Open a message; optionally lead with a tag-only thinking block (route visibility),
 // then the text block. Returns block-index helpers for multi-block streams.
-function openAnthropicStream(res, model, tag, tagAlways, keepalive) {
+function openAnthropicStream(res, model, tag, tagAlways, keepalive, estInput) {
   if (res.headersSent) { // never throw from event handlers: degrade to a dead stream
     console.log("[stream] open on already-started response - returning dead stream (walk-after-bytes escaped a guard)");
     return { textIdx: -1, tagEmitted: true, primed: () => true, prime() {}, openBlock: () => -1, closeBlock() {}, closeAll() {}, stopPings() {} };
@@ -456,7 +457,7 @@ function openAnthropicStream(res, model, tag, tagAlways, keepalive) {
     if (primed) return;
     primed = true;
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+    sseWrite(res, "message_start", { type: "message_start", message: { id: "msg_router_" + Date.now(), type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: estInput || 0, output_tokens: 0 } } });
     if (tag && tagAlways) {
       const i = openBlock({ type: "thinking", thinking: "" });
       sseWrite(res, "content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: tag + "\n" } });
@@ -482,7 +483,7 @@ function emitSseError(res, message) {
 }
 
 function anthropicStreamEnd(res, stopReason, usage) {
-  sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { output_tokens: (usage && usage.output_tokens) || 0 } });
+  sseWrite(res, "message_delta", { type: "message_delta", delta: { stop_reason: stopReason || "end_turn", stop_sequence: null }, usage: { input_tokens: (usage && usage.input_tokens) || 0, output_tokens: (usage && usage.output_tokens) || 0 } });
   sseWrite(res, "message_stop", { type: "message_stop" });
   res.end();
 }
@@ -494,8 +495,8 @@ const captureOn = process.env.BELAY_CAPTURE !== "0";
 // grok/openai-chat: openai chat SSE -> anthropic SSE. Maps streaming tool_calls
 // deltas to tool_use blocks and reasoning_content to thinking blocks (PRD-003/004);
 // leads with the route tag so the user sees who served, in-stream.
-function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive) {
-  const s = openAnthropicStream(res, model, tag, true, keepalive);
+function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
+  const s = openAnthropicStream(res, model, tag, true, keepalive, estInput);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
   // anthropic blocks are sequential: opening one kind closes the other; blocks REOPEN
@@ -575,8 +576,8 @@ function finishStream(res, usage, finish, s, toolEmitted, abnormal, onEmpty) {
   }
   anthropicStreamEnd(res, toolEmitted ? "tool_use" : (finish === "length" ? "max_tokens" : "end_turn"), usage);
 }
-function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive) {
-  const s = openAnthropicStream(res, model, tag, true, keepalive);
+function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
+  const s = openAnthropicStream(res, model, tag, true, keepalive, estInput);
   let buf = "", usage = { output_tokens: 0 };
   let thinkIdx = -1;
   let toolEmitted = false;
@@ -1024,7 +1025,7 @@ function anthropicToResponses(model, body, reqModel) {
 
 // internal anthropic SSE -> responses SSE (C-5): the event alphabet pipeGPTSSE parses upstream,
 // emitted inbound. Every lane event is crash-guarded; upstream end/error still emits a terminal.
-function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
+function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { // estInput: router estimate, fallback when upstream usage lacks input
   const rid = "resp_router_" + Date.now();
   const outModel = reqModel || model;
   const createdAt = Math.floor(Date.now() / 1000);
@@ -1062,7 +1063,8 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel) {
     if (!primed) return; // empty upstream stream: zero client bytes, ladder stays walkable
     const incomplete = stopReason === "max_tokens";
     const t = incomplete ? "response.incomplete" : "response.completed";
-    const u = { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, total_tokens: usage.input_tokens + usage.output_tokens };
+    const inTok = usage.input_tokens || estInput || 0; // usage transparency: codex reads input_tokens to drive auto-compaction; synthetic anthropic message_start reports 0
+    const u = { input_tokens: inTok, output_tokens: usage.output_tokens, total_tokens: inTok + usage.output_tokens };
     sseWrite(res, t, { type: t, response: responseObj(incomplete ? "incomplete" : "completed", u) });
     res.end();
   };
@@ -1163,7 +1165,7 @@ async function serveGrok(model, body, res, tag) {
       r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
     }
   }
-  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag, undefined, true); return { streamed: true }; }
+  if (wantStream && r.stream) { pipeGrokSSE(r.upRes, res, model, tag, undefined, true, estimateTokens(body)); return { streamed: true }; }
   if (isFail(r.status)) throw new Error(`grok ${r.status}: ${r.body.slice(0, 120)}`);
   return { kind: "anthropic", body: openAIToAnthropic("grok-4.7", JSON.parse(r.body), model) };
 }
@@ -1209,7 +1211,7 @@ async function serveGPT(model, body, res, tag) {
     "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/0.156.1", "OpenAI-Beta": "responses=experimental",
   }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => status === 200);
   if (isFail(r.status)) throw new Error(`gpt ${r.status}: ${r.body.slice(0, 200)}`);
-  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag, undefined, true); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
+  if (wantStream) { if (r.stream) { pipeGPTSSE(r.upRes, res, model, tag, undefined, true, estimateTokens(body)); return { streamed: true }; } throw new Error(`gpt ${r.status}: stream not honored` + (r.body ? " - body: " + r.body.slice(0, 200) : "")); }
   if (!r.stream) throw new Error(`gpt ${r.status}: expected event stream`);
   // non-stream client: assemble the JSON response from the upstream SSE events
   const assembled = await new Promise((resolve, reject) => {
@@ -1300,10 +1302,10 @@ function litellmLane(req, res, body, model, wantStream, opts) {
         const onEmpty = () => { empty = true; };
         if (dialect) { // openai-chat SSE -> anthropic SSE (sink) -> client dialect SSE
           const sink = anthropicSink();
-          pipeGrokSSE(ur, sink, model, tag, onEmpty);
-          (dialect === "responses" ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
+          pipeGrokSSE(ur, sink, model, tag, onEmpty, undefined, estimateTokens(body));
+          (dialect === "responses" ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, estimateTokens(body));
         } else {
-          pipeGrokSSE(ur, res, model, tag, onEmpty); // anthropic client: openai-chat SSE -> anthropic SSE directly
+          pipeGrokSSE(ur, res, model, tag, onEmpty, undefined, estimateTokens(body)); // anthropic client: openai-chat SSE -> anthropic SSE directly
         }
         ur.on("end", () => {
           if (empty) { meter(model, "fail"); meterEvent(`[ladder] ${model} failed: empty stream`); reject(new Error("litellm empty stream")); return; }
@@ -1387,13 +1389,14 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
     const model = servable[i];
     const c = CANDIDATES[model];
     const tag = routeTagFor(model, body._routeDifficulty || body._routeEffort); // tag carries difficulty (PRD-006 C) or client effort
+    if (laneQuotaCooldown[c && c.lane] > Date.now()) { meterEvent(`[breaker] ${model} skipped: lane ${c.lane} in quota cooldown`); continue; }
     try {
       if (c && c.lane === "grok") {
         const sink = edge && wantStream ? anthropicSink() : res;
         const out = await serveGrok(model, body, sink, tag);
         if (out.streamed) clientStreaming = true;
         if (out.streamed) {
-          if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
+          if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, est);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
           return;
@@ -1410,7 +1413,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
         const out = await serveGPT(model, body, sink, tag);
         if (out.streamed) clientStreaming = true;
         if (out.streamed) {
-          if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel);
+          if (sink !== res) (rsp ? pipeAnthropicToResponsesSSE : pipeAnthropicToOpenAIChatSSE)(sink, res, model, reqModel, est);
           meter(model, "ok"); meterEvent(`[ladder] ${chain[0]} -> streaming via ${model}`);
           console.log(`[ladder] ${chain[0]} -> streaming via ${model}`);
           return;
@@ -1430,6 +1433,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel) {
       return;
     } catch (e) {
       if (c && (c.lane === "grok" || c.lane === "gpt")) meter(model, "fail"); // litellm lane meters itself
+      if (c && /usage_limit_reached/.test(errText(e))) { const until = Date.now() + 10 * 60 * 1000; if ((laneQuotaCooldown[c.lane] || 0) < until) { laneQuotaCooldown[c.lane] = until; console.log(`[breaker] lane ${c.lane} quota-exhausted: cooling 10m`); } }
       meterEvent(`[ladder] ${model} failed: ${errText(e).slice(0, 90)}`);
       if (clientStreaming) { // PRD-005: client bytes already flowed; the lane closed the client stream
         console.log(`[ladder] ${chain[0]} -> stream aborted mid-flight (no walk; client stream owned by lane)`);
