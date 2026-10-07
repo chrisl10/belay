@@ -1106,6 +1106,7 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
     if (res.writableEnded) return;
     if (!primed) return; // empty upstream stream: zero client bytes, ladder stays walkable
     const incomplete = stopReason === "max_tokens";
+    if (incomplete) { console.log("[incomplete] responses session ended max_tokens (output budget exhausted)"); meterEvent("[incomplete] responses session ended max_tokens (output budget exhausted)"); } // observability only, stream unchanged: codex reconnects on this terminal (RUNBOOK known issue 3)
     const t = incomplete ? "response.incomplete" : "response.completed";
     const inTok = usage.input_tokens || estInput || 0; // usage transparency: codex reads input_tokens to drive auto-compaction; synthetic anthropic message_start reports 0
     const u = { input_tokens: inTok, output_tokens: usage.output_tokens, total_tokens: inTok + usage.output_tokens, input_tokens_details: { cached_tokens: usage.cache_read_input_tokens || 0 } }; // PRD-001 R1/R3.2: real -> carryover est -> estimate, cache hits surfaced
@@ -1726,10 +1727,13 @@ function handleRequest(req, res) {
     try { const cs = fs.readdirSync(CAPTURE_DIR).filter((x) => x.endsWith(".sse")); captureCount = cs.length; for (const c of cs) { const m = c.match(/stream-(\d+)-/); if (m) lastCapture = Math.max(lastCapture, Number(m[1])); } } catch {}
     // Lane health: per-candidate attempt outcomes; a lane is DEGRADED when it has
     // recent failures and no recent success (stale token, dead key, empty streams).
+    // Degraded is candidate-gated: a RETIRED model stays in USAGE history forever
+    // (all-fail, nothing left to fix) - stats kept, but it is no lane and never degrades.
     const lanes = {};
+    const cand = cfg.candidates; // per-request read: hot-reload can retire a candidate mid-flight
     for (const [name, m] of Object.entries(USAGE.models)) {
       const lastOkAgoSec = m.lastServed ? Math.floor((Date.now() - m.lastServed) / 1000) : null;
-      const degraded = m.failed > 0 && (m.ok === 0 || lastOkAgoSec === null || lastOkAgoSec > 3600);
+      const degraded = m.failed > 0 && (m.ok === 0 || lastOkAgoSec === null || lastOkAgoSec > 3600) && !!cand[name];
       lanes[name] = { requests: m.requests, ok: m.ok, failed: m.failed, lastOkAgoSec, degraded };
     }
     const degradedLanes = Object.entries(lanes).filter(([, l]) => l.degraded).map(([n]) => n);
