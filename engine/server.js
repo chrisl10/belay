@@ -118,7 +118,9 @@ function meterEvent(text) { USAGE.events.unshift({ t: Date.now(), text: String(t
 // utilization, and health are per-PLAN, not per-model (glm-5.3 + glm-5.3-flash
 // drain the same z.ai window; astra/sol/luna drain the same OpenAI plan).
 function providerPools() {
-  const budget = (cfg.auto && cfg.auto.laneBudgetTokens) || 500000;
+  // Plans differ widely in real capacity (GLM Max is prompt-capped weekly, OpenAI/xAI
+  // publish nothing). Per-pool budgets express that; global value is the fallback.
+  const budgetFor = (pool) => ((cfg.auto && cfg.auto.laneBudgetTokensPerPool) || {})[pool] || (cfg.auto && cfg.auto.laneBudgetTokens) || 500000;
   const pools = {};
   const poolOf = (name, lane) => {
     if (lane === "gpt") return "openai-plan";
@@ -130,7 +132,7 @@ function providerPools() {
   if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
   for (const [name, cd] of Object.entries(CANDIDATES)) {
     const pool = poolOf(name, cd.lane);
-    const p = pools[pool] || (pools[pool] = { tokensToday: 0, failsToday: 0, models: [], budgetTokens: pool === "openrouter-paygo" ? 0 : budget });
+    const p = pools[pool] || (pools[pool] = { tokensToday: 0, failsToday: 0, models: [], budgetTokens: pool === "openrouter-paygo" ? 0 : budgetFor(pool) });
     p.models.push(name);
     const d = USAGE.day.models[name] || { tokens: 0, fails: 0 };
     p.tokensToday += d.tokens;
