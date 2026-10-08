@@ -93,6 +93,23 @@ function meter(model, outcome, tokens, ms) {
   m.requests++;
   if (outcome === "ok") { m.ok++; m.lastServed = Date.now(); if (ms) m.msTotal += ms; if (tokens) { m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0; } }
   else if (outcome === "fail") m.failed++;
+  persistUsage();
+}
+// Streams meter outcome at hop hand-off, before upstream usage exists; the real
+// token counts arrive at stream completion. meterTokens adds them without
+// re-counting the request so day pools (and providerPools feeding the picker)
+// reflect streamed traffic too.
+function meterTokens(model, tokens) {
+  if (!tokens) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (!USAGE.day || USAGE.day.date !== today) USAGE.day = { date: today, models: {} };
+  const dm = USAGE.day.models[model] || (USAGE.day.models[model] = { tokens: 0, fails: 0 });
+  dm.tokens += (tokens.in || 0) + (tokens.out || 0);
+  const m = USAGE.models[model] || (USAGE.models[model] = { requests: 0, ok: 0, failed: 0, tokensIn: 0, tokensOut: 0, lastServed: 0, msTotal: 0 });
+  m.tokensIn += tokens.in || 0; m.tokensOut += tokens.out || 0;
+  persistUsage();
+}
+function persistUsage() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(USAGE_PATH, JSON.stringify({ startedAt: USAGE.startedAt, day: USAGE.day, models: USAGE.models, events: USAGE.events })); } catch {}
 }
 function meterEvent(text) { USAGE.events.unshift({ t: Date.now(), text: String(text).slice(0, 160) }); if (USAGE.events.length > 50) USAGE.events.pop(); }
@@ -417,7 +434,7 @@ async function decideAuto(body) {
     task: task.slice(0, (cfg.auto && cfg.auto.maxTaskChars) || 2000),
     estimatedPromptTokens: est, // context-window routing: the picker sees the size class it is routing for
     providerPoolsToday: pools,
-    recentLadderEvents: USAGE.events.slice(0, 6).map((e) => e.text),
+    recentLadderEvents: USAGE.events.filter((e) => (e.t || 0) >= Date.parse(new Date().toISOString().slice(0, 10) + "T00:00:00Z")).slice(0, 6).map((e) => e.text), // same UTC day only: yesterday's failures must not narrate as "recent" to the picker
   }, questions: { route: q, difficulty: dq } });
   const picked = (result.answers.route || {}).choice;
   const difficulty = (result.answers.difficulty || {}).choice || "";
@@ -553,11 +570,11 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput, onUsa
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, false, onEmpty); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, false, onEmpty); return; }
       try {
         const j = JSON.parse(payload);
-        const d = (j.choices || [{}])[0].delta || {};
-        const fr = (j.choices || [{}])[0].finish_reason;
+        const d = ((j.choices || [{}])[0] || {}).delta || {}; // x.ai usage chunk ships choices: [] - unguarded [0].delta threw and the catch swallowed the usage
+        const fr = ((j.choices || [{}])[0] || {}).finish_reason;
         if (typeof fr === "string" && fr) finish = fr;
         const rc = (typeof d.reasoning_content === "string" && d.reasoning_content) || (d.reasoning && typeof d.reasoning.content === "string" && d.reasoning.content);
         if (rc) { // PRD-004: reasoning deltas -> thinking block, tag rides first
@@ -591,8 +608,8 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput, onUsa
   });
   let finish = "";
   let toolEmitted = false;
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
+  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
@@ -664,6 +681,7 @@ function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
         if (t === "response.completed" || t === "response.incomplete") {
           const u = (j.response || {}).usage || {};
           closeThink(); s.closeAll();
+          meterTokens(model, { in: u.input_tokens || 0, out: u.output_tokens || usage.output_tokens });
           anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || usage.output_tokens, cache_read_input_tokens: ((u.input_tokens_details || {}).cached_tokens) || 0, cache_creation_input_tokens: 0 }); // PRD-001 R1: responses-native cached_tokens carried, not dropped
           return;
         }
@@ -1197,6 +1215,7 @@ async function serveGrok(model, body, res, tag) {
   if (!t.grok) throw new Error("no grok token");
   const ob = anthropicToOpenAI(body);
   ob.model = "grok-4.7";
+  if (ob.stream) ob.stream_options = { include_usage: true }; // without it x.ai omits the usage chunk and streamed tokens never reach the day pools (same fix as the litellm lane, PR #3)
   const wantStream = !!ob.stream;
   let r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
   if ((r.status === 401 || r.status === 403) && !r.stream) { // credential rot: refresh beside-config script (60s exec cooldown), re-read token, retry once
