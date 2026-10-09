@@ -327,7 +327,8 @@ function heuristicModel(body, est, orchestratorOnly) { // window+modality-aware 
     return { model: null, tooLarge: tl };
   }
   let taskLen = 0; try { taskLen = JSON.stringify((body && body.messages) || []).length; } catch {}
-  const prefer = orchestratorOnly ? "glm-5.3" : ((image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3"); // PRD-004: an orchestrator-scoped fallback never lands on a hop-class model
+  const orchPrefer = ((cfg.auto && Array.isArray(cfg.auto.orchestratorPrimary) && cfg.auto.orchestratorPrimary.find((m) => fits.includes(m))) || "glm-5.3");
+  const prefer = orchestratorOnly ? orchPrefer : ((image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3"); // PRD-004 owner rule 2026-10-09: primary tier (astra/sol) first; glm-5.3 only when no primary fits
   const pick = fits.includes(prefer) ? prefer : fits.slice().sort((a, b) => (windowFor(b) || 0) - (windowFor(a) || 0))[0];
   return { model: pick };
 }
@@ -379,7 +380,12 @@ async function decideAuto(body, orchestratorOnly) {
   const task = messages.filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
   const orchList = (cfg.auto && Array.isArray(cfg.auto.orchestratorModels) && cfg.auto.orchestratorModels.length) ? cfg.auto.orchestratorModels : ["glm-5.3"]; // PRD-004: orchestrator-class membership is config-authored
-  const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)) && (!orchestratorOnly || orchList.includes(k)));
+  let eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)) && (!orchestratorOnly || orchList.includes(k)));
+  const orchPrimary = (cfg.auto && Array.isArray(cfg.auto.orchestratorPrimary) && cfg.auto.orchestratorPrimary.length) ? cfg.auto.orchestratorPrimary : [];
+  if (orchestratorOnly && orchPrimary.length) {
+    const prim = eligible.filter((k) => orchPrimary.includes(k));
+    if (prim.length) eligible = prim; // PRD-004 owner rule 2026-10-09: primary tier wins whenever any of it can serve; glm-5.3 joins only when none can (quota, cooldown, window)
+  }
   if (!eligible.length) { // window routing: nothing fits, do not even spend the jev call
     console.log(`[auto] prompt too large for every lane (est ${est} tokens) - 400 no walk`);
     meterEvent(`[auto] prompt too large (est ${est} tokens) - 400 no walk`);
@@ -1431,7 +1437,11 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel, se
   const chat = dialect === "openai-chat";
   const rsp = dialect === "responses";
   const edge = chat || rsp;
-  const chain = [startModel, ...((CHAINS[startModel] || []).filter((m) => m !== startModel))];
+  let chain = [startModel, ...((CHAINS[startModel] || []).filter((m) => m !== startModel))];
+  if (reqModel === "orchestrator") { // PRD-004 owner rule: the orchestrator seat never falls out of class mid-session
+    const _ol = (cfg.auto && Array.isArray(cfg.auto.orchestratorModels) && cfg.auto.orchestratorModels.length) ? cfg.auto.orchestratorModels : ["glm-5.3"];
+    chain = [...new Set([startModel, ..._ol.filter((m) => m !== startModel && CANDIDATES[m])])];
+  }
   // Context-window routing: a hop whose window cannot fit the request can only
   // fail upstream (input_too_large / ContextWindowExceeded) and poison the lane
   // counters. Skip those hops up front; if NOTHING fits, reject with 400 - a
