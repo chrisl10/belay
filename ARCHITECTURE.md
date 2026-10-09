@@ -32,6 +32,28 @@ lane natively produces an internal Anthropic shape; the edge translators
 (`anthropicToOpenAIChat`, `anthropicToResponses`) convert JSON and SSE to the
 client dialect. Streaming is translated per event.
 
+## Dials: `auto` and `orchestrator`
+
+Two pseudo-models ride the same endpoint. `auto` lets the picker consider
+every candidate (cheapest clearly-sufficient, spread across provider pools).
+`orchestrator` restricts the picker to `auto.orchestratorModels`, the
+frontier-capable class, for long-lived main sessions; spawned subagents stay
+on `auto` and may land on cheaper hop-class lanes. `GET /v1/models` lists both
+beside the concrete lanes, so harness model pickers discover them.
+
+## Session stickiness (dial-aware)
+
+A session's first request fingerprints it (sha256 of the leading system +
+content bytes) and pins the lane the picker chose, so turn 2+ reuses the warm
+prompt cache instead of re-routing. A pin records its dial (`auto`,
+`orchestrator`, or an explicit model name) and only applies while the request
+carries the same dial: switching dials mid-session re-runs the picker and
+re-pins on the next turn. Ladder walks and usage updates re-pin the serving
+lane but preserve the dial. Pins are in-memory only and expire after two idle
+hours. Fingerprinting is prefix-based: two sessions in one project can share a
+prefix, which is harmless because the dial check still routes each request
+into the class it asked for.
+
 ## The ladder
 
 Each candidate has a chain (its own fallback order, `@openrouter` expands to the
