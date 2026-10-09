@@ -357,9 +357,9 @@ function stickyLookup(fp) {
   for (const [k, v] of sessionAffinity) if (now - v.lastSeenMs > SESSION_IDLE_MS) sessionAffinity.delete(k);
   return sessionAffinity.get(fp) || null;
 }
-function stickyPin(fp, h8, model, how) {
-  sessionAffinity.set(fp, { model, lastRealPromptTokens: 0, lastSeenMs: Date.now() });
-  console.log(`[sticky] session ${h8} pinned -> ${model} (${how})`);
+function stickyPin(fp, h8, model, how, dial) {
+  sessionAffinity.set(fp, { model, dial: dial || "auto", lastRealPromptTokens: 0, lastSeenMs: Date.now() });
+  console.log(`[sticky] session ${h8} pinned -> ${model} (${how}, dial=${dial || "auto"})`);
 }
 // R3.1/R3.3: prefer the session's last REAL prompt size (+ one turn of growth)
 // over chars/4 when sizing windows and message_start estimates.
@@ -1446,14 +1446,14 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel, se
     if (!sessionCtx || !sessionCtx.fp) return;
     if (!u || typeof u.input_tokens !== "number" || !(u.input_tokens > 0)) return;
     const prev = sessionAffinity.get(sessionCtx.fp) || {};
-    sessionAffinity.set(sessionCtx.fp, { model: prev.model || sessionCtx.pinnedModel, lastRealPromptTokens: u.input_tokens, lastSeenMs: Date.now() });
+    sessionAffinity.set(sessionCtx.fp, { model: prev.model || sessionCtx.pinnedModel, dial: prev.dial || "auto", lastRealPromptTokens: u.input_tokens, lastSeenMs: Date.now() });
   };
   const stickyServed = (servedModel, reason) => {
     if (!sessionCtx || !sessionCtx.fp) return;
     const sc = CANDIDATES[servedModel]; if (sc && sc.lane) laneQuotaStrikes[sc.lane] = 0; // PRD-004: a successful serve clears the lane's quota strikes
     const prev = sessionAffinity.get(sessionCtx.fp) || {};
     if (sessionCtx.pinnedModel && servedModel !== sessionCtx.pinnedModel) console.log(`[sticky] session ${sessionCtx.h8} walked ${sessionCtx.pinnedModel} -> ${servedModel}: ${reason || "ladder"}`);
-    sessionAffinity.set(sessionCtx.fp, { model: servedModel, lastRealPromptTokens: prev.lastRealPromptTokens || 0, lastSeenMs: Date.now() });
+    sessionAffinity.set(sessionCtx.fp, { model: servedModel, dial: prev.dial || "auto", lastRealPromptTokens: prev.lastRealPromptTokens || 0, lastSeenMs: Date.now() });
   };
   const effMax = effMaxTokens(body);
   const servable = [], skipped = [];
@@ -1647,10 +1647,12 @@ async function handleChatCompletions(req, res, body) {
   const _h8 = _fp.slice(0, 8);
   const _pinned = stickyLookup(_fp);
   let startModel;
-  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+  const _dial = reqModel === "orchestrator" ? "orchestrator" : (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) ? "auto" : reqModel;
+  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter")) && (_pinned.dial || "auto") === _dial) {
     console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
     startModel = _pinned.model;
   } else {
+    if (_pinned) console.log(`[sticky] session ${_h8} dial ${_pinned.dial || "auto"} -> ${_dial}: repick`);
     startModel = reqModel;
     if (reqModel === "orchestrator") {
       startModel = "orchestrator"; // PRD-004: picker restricted to orchestrator-class lanes
@@ -1665,9 +1667,9 @@ async function handleChatCompletions(req, res, body) {
         startModel = _h.model;
         console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
       }
-      stickyPin(_fp, _h8, startModel, "auto");
+      stickyPin(_fp, _h8, startModel, "auto", _dial);
     } else {
-      stickyPin(_fp, _h8, startModel, "explicit");
+      stickyPin(_fp, _h8, startModel, "explicit", _dial);
     }
   }
   // C-7 ladder contract applies to the chat dialect too: no direct short-circuit.
@@ -1694,10 +1696,12 @@ async function handleResponses(req, res, body) {
   const _h8 = _fp.slice(0, 8);
   const _pinned = stickyLookup(_fp);
   let startModel;
-  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+  const _dial = reqModel === "orchestrator" ? "orchestrator" : (checked.passthrough || reqModel === "auto") ? "auto" : reqModel;
+  if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter")) && (_pinned.dial || "auto") === _dial) {
     console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
     startModel = _pinned.model;
   } else {
+    if (_pinned) console.log(`[sticky] session ${_h8} dial ${_pinned.dial || "auto"} -> ${_dial}: repick`);
     startModel = checked.passthrough ? "auto" : checked.model;
     if (startModel === "auto" || startModel === "orchestrator") {
       try { const _p = await decideAuto(translated, startModel === "orchestrator"); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
@@ -1707,9 +1711,9 @@ async function handleResponses(req, res, body) {
         startModel = _h.model;
         console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
       }
-      stickyPin(_fp, _h8, startModel, "auto");
+      stickyPin(_fp, _h8, startModel, "auto", _dial);
     } else {
-      stickyPin(_fp, _h8, startModel, "explicit");
+      stickyPin(_fp, _h8, startModel, "explicit", _dial);
     }
   }
   // C-7: every pick rides serveWithLadder so a 429 on any lane (incl. litellm) walks the chain
@@ -1769,6 +1773,27 @@ function handleRequest(req, res) {
     const degradedLanes = Object.entries(lanes).filter(([, l]) => l.degraded).map(([n]) => n);
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ ok: degradedLanes.length === 0, pid: process.pid, uptimeSec: Math.floor(process.uptime()), emptyWalks: USAGE.events.filter((e) => String(e.text).includes("empty stream")).length, captureCount, lastCapture, lanes, degradedLanes, note: "degradedLanes names provider lanes failing with no recent success - fix the lane (token/key), not the router" }));
+  }
+  if (req.method === "GET" && req.url.split("?")[0] === "/v1/models") { // PRD-004: surface fabric pseudo-models beside the litellm list
+    const up = http.request({ host: LITELLM.host, port: LITELLM.port, method: "GET", path: "/v1/models", headers: { authorization: req.headers.authorization || "" } }, (ur) => {
+      let mbuf = "";
+      ur.on("data", (c) => mbuf += c);
+      ur.on("end", () => {
+        try {
+          const j = JSON.parse(mbuf);
+          const ids = ["auto", "orchestrator", ...(j.data || []).map((m) => m.id)];
+          j.data = ids.map((id) => ({ id, object: "model", created: 1677610602, owned_by: "openai" }));
+          res.writeHead(ur.statusCode || 200, { "content-type": "application/json" });
+          res.end(JSON.stringify(j));
+        } catch {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(mbuf);
+        }
+      });
+    });
+    up.on("error", () => { res.writeHead(502, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "litellm models unreachable" } })); });
+    up.end();
+    return;
   }
   if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
     res.writeHead(200, { "content-type": "application/json" });
@@ -1843,10 +1868,12 @@ function handleRequest(req, res) {
     const _h8 = _fp.slice(0, 8);
     const _pinned = stickyLookup(_fp);
     try {
-      if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter"))) {
+      const _dial = parsed.model === "orchestrator" ? "orchestrator" : parsed.model === "auto" ? "auto" : parsed.model;
+      if (_pinned && (CANDIDATES[_pinned.model] || _pinned.model.startsWith("openrouter")) && (_pinned.dial || "auto") === _dial) {
         console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
         startModel = _pinned.model;
       } else {
+        if (_pinned) console.log(`[sticky] session ${_h8} dial ${_pinned.dial || "auto"} -> ${_dial}: repick`);
         if (startModel === "auto" || startModel === "orchestrator") {
           try { const _p = await decideAuto(parsed, startModel === "orchestrator"); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
           catch (e) {
@@ -1855,9 +1882,9 @@ function handleRequest(req, res) {
             startModel = _h.model;
             console.log(`[auto] fallback heuristic -> ${startModel} (${String(e.message).slice(0, 60)})`);
           }
-          stickyPin(_fp, _h8, startModel, "auto");
+          stickyPin(_fp, _h8, startModel, "auto", _dial);
         } else {
-          stickyPin(_fp, _h8, startModel, "explicit");
+          stickyPin(_fp, _h8, startModel, "explicit", _dial);
         }
       }
     } catch (e) {
