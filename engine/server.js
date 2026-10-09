@@ -20,6 +20,7 @@ const H = os.homedir();
 const CONFIG_PATH = process.env.BELAY_CONFIG || process.env.FABRIC_CONFIG || path.join(H, "belay", "belay.config.json");
 let cfg = null, cfgMtimeMs = 0, CANDIDATES = {}, OR = [], CHAINS = {};
 const laneQuotaCooldown = {}; // lane -> epoch ms; usage_limit_reached 429s cool the lane instead of re-attempting every request
+const laneQuotaStrikes = {}; // PRD-004: usage_limit_reached strikes per lane; a second strike within a walk cools the lane, any success resets
 function validateConfig(c) {
   if (!c || typeof c !== "object" || Array.isArray(c)) return "config: not an object";
   if (!c.candidates || typeof c.candidates !== "object" || Array.isArray(c.candidates) || !Object.keys(c.candidates).length) return "candidates: missing or empty";
@@ -190,7 +191,7 @@ function validateMessageBody(body) {
   if (model === undefined || model === null || typeof model !== "string") {
     return { ok: false, message: "model: required field missing or not a string" };
   }
-  if (model === "auto" || CANDIDATES[model] || model.startsWith("openrouter")) {
+  if (model === "auto" || model === "orchestrator" || CANDIDATES[model] || model.startsWith("openrouter")) { // PRD-004: "orchestrator" = picker restricted to auto.orchestratorModels
     return { ok: true, model };
   }
   return { ok: true, passthrough: true, model };
@@ -316,7 +317,7 @@ function maxServableWindow(models) {
 function promptTooLargeMessage(est, maxWindow) {
   return `router: prompt too large for every lane (estimated ~${est} tokens vs largest window ${maxWindow || "?"}). No fallback can serve this request - compact or restart the client session.`;
 }
-function heuristicModel(body, est) { // window+modality-aware successor of the old flash/glm fallback pick
+function heuristicModel(body, est, orchestratorOnly) { // window+modality-aware successor of the old flash/glm fallback pick
   const { image, video } = detectModalities(body && body.messages);
   const fits = Object.keys(CANDIDATES).filter((k) => (!image || (CANDIDATES[k].mods || []).includes("image")) && (!video || (CANDIDATES[k].mods || []).includes("video")) && windowFits(k, est, effMaxTokens(body)));
   if (!fits.length) {
@@ -326,7 +327,7 @@ function heuristicModel(body, est) { // window+modality-aware successor of the o
     return { model: null, tooLarge: tl };
   }
   let taskLen = 0; try { taskLen = JSON.stringify((body && body.messages) || []).length; } catch {}
-  const prefer = (image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3";
+  const prefer = orchestratorOnly ? "glm-5.3" : ((image || video || taskLen < 400) ? "glm-5.3-flash" : "glm-5.3"); // PRD-004: an orchestrator-scoped fallback never lands on a hop-class model
   const pick = fits.includes(prefer) ? prefer : fits.slice().sort((a, b) => (windowFor(b) || 0) - (windowFor(a) || 0))[0];
   return { model: pick };
 }
@@ -372,12 +373,13 @@ function estimateForSession(body, fp) {
   return estimateTokens(body);
 }
 
-async function decideAuto(body) {
+async function decideAuto(body, orchestratorOnly) {
   const messages = safeMessages(body && body.messages);
   const est = estimateTokens(body);
   const task = messages.filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
-  const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)));
+  const orchList = (cfg.auto && Array.isArray(cfg.auto.orchestratorModels) && cfg.auto.orchestratorModels.length) ? cfg.auto.orchestratorModels : ["glm-5.3"]; // PRD-004: orchestrator-class membership is config-authored
+  const eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)) && (!orchestratorOnly || orchList.includes(k)));
   if (!eligible.length) { // window routing: nothing fits, do not even spend the jev call
     console.log(`[auto] prompt too large for every lane (est ${est} tokens) - 400 no walk`);
     meterEvent(`[auto] prompt too large (est ${est} tokens) - 400 no walk`);
@@ -441,7 +443,7 @@ async function decideAuto(body) {
   const picked = (result.answers.route || {}).choice;
   const difficulty = (result.answers.difficulty || {}).choice || "";
   if (!CANDIDATES[picked]) throw new Error("bad pick " + JSON.stringify(picked));
-  console.log(`[auto] typesafe -> ${picked} (${difficulty || "?"}, ${Date.now() - t0}ms)`);
+  console.log(`[auto] typesafe -> ${picked} (${difficulty || "?"}, ${Date.now() - t0}ms${orchestratorOnly ? ", orchestrator" : ""})`);
   return { model: picked, difficulty };
 }
 
@@ -1448,6 +1450,7 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel, se
   };
   const stickyServed = (servedModel, reason) => {
     if (!sessionCtx || !sessionCtx.fp) return;
+    const sc = CANDIDATES[servedModel]; if (sc && sc.lane) laneQuotaStrikes[sc.lane] = 0; // PRD-004: a successful serve clears the lane's quota strikes
     const prev = sessionAffinity.get(sessionCtx.fp) || {};
     if (sessionCtx.pinnedModel && servedModel !== sessionCtx.pinnedModel) console.log(`[sticky] session ${sessionCtx.h8} walked ${sessionCtx.pinnedModel} -> ${servedModel}: ${reason || "ladder"}`);
     sessionAffinity.set(sessionCtx.fp, { model: servedModel, lastRealPromptTokens: prev.lastRealPromptTokens || 0, lastSeenMs: Date.now() });
@@ -1527,7 +1530,11 @@ async function serveWithLadder(req, res, body, startModel, dialect, reqModel, se
       return;
     } catch (e) {
       if (c && (c.lane === "grok" || c.lane === "gpt")) meter(model, "fail"); // litellm lane meters itself
-      if (c && /usage_limit_reached/.test(errText(e))) { const until = Date.now() + 10 * 60 * 1000; if ((laneQuotaCooldown[c.lane] || 0) < until) { laneQuotaCooldown[c.lane] = until; console.log(`[breaker] lane ${c.lane} quota-exhausted: cooling 10m`); } }
+      if (c && /usage_limit_reached/.test(errText(e))) { // PRD-004 two-strike: per-model budgets earn one sibling attempt before the lane cools
+        const strikes = (laneQuotaStrikes[c.lane] || 0) + 1;
+        if (strikes >= 2) { const until = Date.now() + 10 * 60 * 1000; if ((laneQuotaCooldown[c.lane] || 0) < until) { laneQuotaCooldown[c.lane] = until; laneQuotaStrikes[c.lane] = 0; console.log(`[breaker] lane ${c.lane} quota-exhausted (2 strikes): cooling 10m`); } }
+        else { laneQuotaStrikes[c.lane] = strikes; console.log(`[breaker] ${model} usage_limit_reached (strike 1 of 2): trying next model in lane ${c.lane}`); }
+      }
       meterEvent(`[ladder] ${model} failed: ${errText(e).slice(0, 90)}`);
       walkReason = errText(e).slice(0, 90); // PRD-001 R2: the walk log carries the last hop's failure text
       if (clientStreaming) { // PRD-005: client bytes already flowed; the lane closed the client stream
@@ -1645,13 +1652,15 @@ async function handleChatCompletions(req, res, body) {
     startModel = _pinned.model;
   } else {
     startModel = reqModel;
-    if (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) {
+    if (reqModel === "orchestrator") {
+      startModel = "orchestrator"; // PRD-004: picker restricted to orchestrator-class lanes
+    } else if (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) {
       startModel = "auto"; // absent / "auto" / unknown model -> auto (B-3)
     }
-    if (startModel === "auto") {
-      try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+    if (startModel === "auto" || startModel === "orchestrator") {
+      try { const _p = await decideAuto(translated, startModel === "orchestrator"); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
       catch (e) {
-        const _h = heuristicModel(translated, estimateTokens(translated));
+        const _h = heuristicModel(translated, estimateTokens(translated), startModel === "orchestrator");
         if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
         startModel = _h.model;
         console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
@@ -1690,10 +1699,10 @@ async function handleResponses(req, res, body) {
     startModel = _pinned.model;
   } else {
     startModel = checked.passthrough ? "auto" : checked.model;
-    if (startModel === "auto") {
-      try { const _p = await decideAuto(translated); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
+    if (startModel === "auto" || startModel === "orchestrator") {
+      try { const _p = await decideAuto(translated, startModel === "orchestrator"); if (_p.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; translated._routeDifficulty = _p.difficulty; }
       catch (e) {
-        const _h = heuristicModel(translated, estimateTokens(translated));
+        const _h = heuristicModel(translated, estimateTokens(translated), startModel === "orchestrator");
         if (_h.tooLarge) return sendOpenAIError(res, 400, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
         startModel = _h.model;
         console.log(`[auto] fallback heuristic -> ${startModel} (${errText(e).slice(0, 60)})`);
@@ -1838,10 +1847,10 @@ function handleRequest(req, res) {
         console.log(`[sticky] session ${_h8} -> ${_pinned.model} (cache-warm)`);
         startModel = _pinned.model;
       } else {
-        if (startModel === "auto") {
-          try { const _p = await decideAuto(parsed); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
+        if (startModel === "auto" || startModel === "orchestrator") {
+          try { const _p = await decideAuto(parsed, startModel === "orchestrator"); if (_p.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_p.tooLarge.est, _p.tooLarge.maxWindow)); startModel = _p.model; parsed._routeDifficulty = _p.difficulty; }
           catch (e) {
-            const _h = heuristicModel(parsed, estimateTokens(parsed));
+            const _h = heuristicModel(parsed, estimateTokens(parsed), startModel === "orchestrator");
             if (_h.tooLarge) return sendInvalidRequest(res, promptTooLargeMessage(_h.tooLarge.est, _h.tooLarge.maxWindow));
             startModel = _h.model;
             console.log(`[auto] fallback heuristic -> ${startModel} (${String(e.message).slice(0, 60)})`);
