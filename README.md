@@ -111,6 +111,7 @@ the router. Same auth as the API; a
 - [ARCHITECTURE.md](ARCHITECTURE.md): dialects, ladder, jev, SSE translation
 - [FAQ.md](FAQ.md): ToS honesty, cost math, comparison details
 - [HARNESS-ROADMAP.md](HARNESS-ROADMAP.md): the big 3 + the expansion queue
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to land changes
 
 ## Honesty section
 
