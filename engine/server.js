@@ -543,8 +543,10 @@ function openAnthropicStream(res, model, tag, tagAlways, keepalive, estInput) {
 function emitSseError(res, message) {
   if (res.writableEnded) return;
   try {
-    if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    if (!res.headersSent) { res.end(); return; }
+    if (!res.__sink) { // sinks are PassThroughs with no header state; the error must reach the reader
+      if (!res.headersSent) res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      if (!res.headersSent) { res.end(); return; }
+    }
     res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message } })}\n\n`);
     res.end();
   } catch {}
@@ -580,7 +582,7 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput, onUsa
       buf = buf.slice(idx + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload === "[DONE]") { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, false, onEmpty); return; }
+      if (payload === "[DONE]") { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); if (!(usage.output_tokens > 0 || toolEmitted)) return emptyAbort("done with zero deltas"); finishStream(res, usage, finish, s, toolEmitted, false, onEmpty); return; }
       try {
         const j = JSON.parse(payload);
         const d = ((j.choices || [{}])[0] || {}).delta || {}; // x.ai usage chunk ships choices: [] - unguarded [0].delta threw and the catch swallowed the usage
@@ -618,8 +620,11 @@ function pipeGrokSSE(upRes, res, model, tag, onEmpty, keepalive, estInput, onUsa
   });
   let finish = "";
   let toolEmitted = false;
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
+  // 2026-10-09: same zero-content guard as the gpt pipe (see pipeGPTSSE).
+  const emptyAbort = (why) => { if (s.stopPings) { try { s.stopPings(); } catch {} } console.log(`[empty] ${model}: zero-content stream end (${why})`); meterEvent(`[empty] ${model}: zero-content stream end (${why})`); emitSseError(res, `empty stream from ${model} (${why}); retry the turn`); };
+  const hadContent = () => usage.output_tokens > 0 || toolEmitted;
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); if (!hadContent()) return emptyAbort("upstream end"); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
+  upRes.on("error", (e) => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (usage.input_tokens > 0) meterTokens(model, { in: usage.input_tokens, out: usage.output_tokens }); if (!hadContent()) return emptyAbort("upstream " + errText(e).slice(0, 60)); finishStream(res, usage, finish, s, toolEmitted, true, onEmpty); } });
 }
 
 // gpt: openai responses SSE -> anthropic SSE. PRD-004: reasoning summary deltas
@@ -695,12 +700,17 @@ function pipeGPTSSE(upRes, res, model, tag, onEmpty, keepalive, estInput) {
           anthropicStreamEnd(res, t === "response.incomplete" ? "max_tokens" : (toolEmitted ? "tool_use" : "end_turn"), { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || usage.output_tokens, cache_read_input_tokens: ((u.input_tokens_details || {}).cached_tokens) || 0, cache_creation_input_tokens: 0 }); // PRD-001 R1: responses-native cached_tokens carried, not dropped
           return;
         }
-        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); return; }
+        if (t === "error" || t === "response.failed") { closeThink(); s.closeAll(); if (!(usage.output_tokens > 0 || toolEmitted)) return emptyAbort("sse error event"); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); return; }
       } catch {}
     }
   });
-  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); } });
-  upRes.on("error", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); emitSseError(res, "upstream connection failed mid stream; retry the turn"); } });
+  // 2026-10-09 coraura stall: an abnormal end with zero content must not fake a clean
+  // end_turn (the harness reads an empty-but-valid message and silently retries forever).
+  // Surface it as an in-stream error so codex/T3 see the failure and can react.
+  const emptyAbort = (why) => { if (s.stopPings) { try { s.stopPings(); } catch {} } console.log(`[empty] ${model}: zero-content stream end (${why})`); meterEvent(`[empty] ${model}: zero-content stream end (${why})`); emitSseError(res, `empty stream from ${model} (${why}); retry the turn`); };
+  const hadContent = () => usage.output_tokens > 0 || toolEmitted;
+  upRes.on("end", () => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (!hadContent()) return emptyAbort("upstream end"); finishStream(res, usage, "", s, toolEmitted, true, onEmpty); } });
+  upRes.on("error", (e) => { if (!res.writableEnded) { closeThink(); s.closeAll(); if (!hadContent()) return emptyAbort("upstream " + errText(e).slice(0, 60)); emitSseError(res, "upstream connection failed mid stream; retry the turn"); } });
 }
 
 // ---------- PRD-001b B-6: anthropic SSE -> openai chat SSE (inverse of pipeGrokSSE) ----------
@@ -799,6 +809,7 @@ function pipeAnthropicToOpenAIChatSSE(upRes, res, model, reqModel) {
 function anthropicSink() {
   const pt = new PassThrough();
   pt.writeHead = () => pt; // the piper owns the real status/headers
+  pt.__sink = true; // emitSseError must write its event, not treat the sink as unprimed
   return pt;
 }
 
@@ -806,7 +817,16 @@ function postUpstream(host, path, headers, bodyStr, timeoutMs, onStatus) {
   // onStatus(status, headers) -> true to stream the response object back (caller gets upRes)
   return new Promise((resolve, reject) => {
     const req = https.request({ host, path, method: "POST", headers: { ...headers, "content-length": Buffer.byteLength(bodyStr) }, timeout: timeoutMs }, (r) => {
-      if (onStatus(r.statusCode, r.headers)) { resolve({ stream: true, upRes: r, status: r.statusCode }); return; }
+      if (onStatus(r.statusCode, r.headers)) {
+        // 2026-10-09 coraura stall: a lane can accept the connection then send nothing
+        // while client keepalive pings hold the harness open (invisible 30-minute retry
+        // loop). First-byte watchdog bounds the wait; the pipes surface a retryable error.
+        const fbMs = (cfg.upstream && typeof cfg.upstream.firstByteTimeoutMs === "number" && cfg.upstream.firstByteTimeoutMs > 0) ? cfg.upstream.firstByteTimeoutMs : 90000;
+        const fb = setTimeout(() => { try { r.destroy(new Error("first-byte timeout (" + fbMs + "ms)")); } catch {} }, fbMs);
+        if (typeof fb.unref === "function") fb.unref();
+        r.once("data", () => clearTimeout(fb));
+        resolve({ stream: true, upRes: r, status: r.statusCode }); return;
+      }
       const chunks = [];
       r.on("data", (c) => chunks.push(c));
       r.on("end", () => resolve({ stream: false, status: r.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
