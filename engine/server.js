@@ -380,7 +380,7 @@ async function decideAuto(body, orchestratorOnly) {
   const task = messages.filter((m) => m && typeof m === "object").map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n").slice(-4000);
   const { image, video } = detectModalities(messages);
   const orchList = (cfg.auto && Array.isArray(cfg.auto.orchestratorModels) && cfg.auto.orchestratorModels.length) ? cfg.auto.orchestratorModels : ["glm-5.3"]; // PRD-004: orchestrator-class membership is config-authored
-  let eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image")) && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)) && (!orchestratorOnly || orchList.includes(k)));
+  let eligible = Object.keys(CANDIDATES).filter((k) => (!image || CANDIDATES[k].mods.includes("image") || CANDIDATES[k].lane === "litellm") && (!video || CANDIDATES[k].mods.includes("video")) && windowFits(k, est, effMaxTokens(body)) && (!orchestratorOnly || orchList.includes(k))); // 2026-10-09: litellm lanes downgrade image parts to placeholders, so they stay eligible for image-bearing requests (text-degraded backup beats 400)
   const orchPrimary = (cfg.auto && Array.isArray(cfg.auto.orchestratorPrimary) && cfg.auto.orchestratorPrimary.length) ? cfg.auto.orchestratorPrimary : [];
   if (orchestratorOnly && orchPrimary.length) {
     const prim = eligible.filter((k) => orchPrimary.includes(k));
