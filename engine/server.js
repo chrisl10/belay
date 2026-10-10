@@ -367,8 +367,9 @@ function stickyPin(fp, h8, model, how, dial) {
 function estimateForSession(body, fp) {
   const pinned = fp && stickyLookup(fp);
   if (pinned && typeof pinned.lastRealPromptTokens === "number" && pinned.lastRealPromptTokens > 0) {
-    const est = pinned.lastRealPromptTokens + 4096;
-    console.log(`[window] session ${String(fp).slice(0, 8)} est ${est} = real ${pinned.lastRealPromptTokens} + 4096 (carryover)`);
+    const bodyEst = estimateTokens(body); // 2026-10-09: never let a stale carryover UNDERSTATE the live body
+    const est = Math.max(pinned.lastRealPromptTokens + 4096, bodyEst);
+    console.log(`[window] session ${String(fp).slice(0, 8)} est ${est} = real ${pinned.lastRealPromptTokens} + 4096 (carryover) vs body ${bodyEst}`);
     return est;
   }
   return estimateTokens(body);
