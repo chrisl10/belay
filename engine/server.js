@@ -1405,6 +1405,15 @@ function litellmLane(req, res, body, model, wantStream, opts) {
   const reqModel = (opts && opts.reqModel) || model;
   const tag = (opts && opts.tag) || "";
   const ob = anthropicToOpenAI(body); // maps tools + tool history (PRD-001c)
+  let _imgDown = 0;
+  for (const m of (ob.messages || [])) {
+    if (!m || !Array.isArray(m.content)) continue;
+    m.content = m.content.map((p) => {
+      if (p && typeof p === "object" && p.type === "image_url") { _imgDown++; return { type: "text", text: "[image omitted: litellm backup lane cannot process images]" }; }
+      return p;
+    });
+  }
+  if (_imgDown) console.log("[litellm] " + model + ": " + _imgDown + " image part(s) downgraded to placeholders (backup lane serves text-degraded rather than exhausting)");
   ob.model = model;
   ob.stream = !!wantStream;
   if (ob.stream) ob.stream_options = { include_usage: true }; // PRD-001 reopen (2026-10-06): litellm emits no usage chunk without this, so cached_tokens never reached streaming clients
