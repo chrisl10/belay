@@ -178,6 +178,67 @@ function tokens() {
   return { grok, gpt, acct };
 }
 
+// ---------- P1 (sitting 83, pattern ported from askalf/dario oauth.ts, MIT) ----------
+// Native grok OAuth refresh. The grok CLI's token expires same-day (~6h); until
+// now a refresh meant a human running the grok CLI, or the daily burn-a-query
+// grok-refresh.sh. Contract (verified live 2026-10-14): POST form
+// grant_type=refresh_token + client_id + refresh_token to auth.x.ai/oauth2/token
+// returns {access_token, refresh_token (ROTATED), expires_in, scope}; the
+// rotation is why the write is single-flight + atomic (tmp + rename).
+const GROK_AUTH_PATH = path.join(H, ".grok", "auth.json");
+const GROK_REFRESH_MARGIN_MS = 30 * 60 * 1000; // refresh this early before expiry
+const GROK_REFRESH_DEAD_MS = 30 * 60 * 1000; // terminal rejection backoff
+let grokRefreshInFlight = null;
+let grokRefreshDeadUntil = 0;
+function grokAuthDoc() {
+  try {
+    const d = JSON.parse(fs.readFileSync(GROK_AUTH_PATH, "utf8"));
+    const iss = Object.keys(d)[0];
+    if (iss && d[iss] && d[iss].key) return { d, iss, e: d[iss] };
+  } catch {}
+  return null;
+}
+function grokStale(e) {
+  const exp = Date.parse(e.expires_at || "");
+  return Number.isFinite(exp) ? exp - Date.now() < GROK_REFRESH_MARGIN_MS : false; // unknown expiry: never block on it
+}
+async function grokRefreshNow(why) {
+  const a = grokAuthDoc();
+  if (!a) throw new Error("no grok auth doc");
+  const form = new URLSearchParams({ grant_type: "refresh_token", client_id: a.e.oidc_client_id || "", refresh_token: a.e.refresh_token || "" }).toString();
+  const r = await postUpstream("auth.x.ai", "/oauth2/token", { "content-type": "application/x-www-form-urlencoded", "user-agent": "grok-cli" }, form, 30000, () => false);
+  if (r.status === 400 || r.status === 401 || r.status === 403) {
+    grokRefreshDeadUntil = Date.now() + GROK_REFRESH_DEAD_MS;
+    console.log(`[grok] refresh ${r.status} (${why}) terminal - KEY-ASK grok-oauth: owner re-login needed; retrying in ${GROK_REFRESH_DEAD_MS / 60000}min: ` + r.body.slice(0, 120));
+    meterEvent(`[grok] refresh ${r.status} terminal - KEY-ASK grok-oauth`);
+    throw new Error("grok refresh terminal " + r.status);
+  }
+  if (r.status !== 200) throw new Error("grok refresh " + r.status + ": " + r.body.slice(0, 80));
+  const tok = JSON.parse(r.body);
+  if (!tok.access_token) throw new Error("grok refresh: no access_token in response");
+  a.e.key = tok.access_token;
+  if (tok.refresh_token) a.e.refresh_token = tok.refresh_token;
+  if (Number.isFinite(Number(tok.expires_in))) a.e.expires_at = new Date(Date.now() + tok.expires_in * 1000).toISOString();
+  a.e.create_time = new Date().toISOString();
+  const tmp = GROK_AUTH_PATH + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(a.d, null, 2));
+  fs.renameSync(tmp, GROK_AUTH_PATH); // atomic: a crashed write can not orphan the rotated refresh_token
+  console.log(`[grok] token refreshed (${why}) -> expires ${a.e.expires_at}${tok.refresh_token ? ", refresh_token rotated" : ""}`);
+  meterEvent("[grok] token refreshed (" + why + ")");
+  return a.e.key;
+}
+async function grokTokenFresh(force) {
+  const a = grokAuthDoc();
+  if (!a) return "";
+  if (!force) {
+    if (!grokStale(a.e)) return a.e.key;
+    if (Date.now() < grokRefreshDeadUntil) return a.e.key;
+  }
+  if (!grokRefreshInFlight) grokRefreshInFlight = grokRefreshNow(force ? "forced" : "scheduled").finally(() => { grokRefreshInFlight = null; });
+  try { return await grokRefreshInFlight; } catch { return a.e.key; } // keep serving the current key; the ladder still walks a truly dead token
+}
+setInterval(() => { grokTokenFresh(false).catch(() => {}); }, 10 * 60 * 1000).unref(); // proactive: 10min checks refresh ~30min early
+
 // ---------- PRD-001a: shared request validation (A-1/A-5) ----------
 // Single validation entry point for message endpoints. Returns:
 //   { ok: true, model }                    -> fabric-managed model (auto / candidate / openrouter-*)
@@ -340,8 +401,13 @@ function heuristicModel(body, est, orchestratorOnly) { // window+modality-aware 
 // prompt cache instead of re-running the picker, and a ladder walk re-pins the
 // lane that actually served. R2.2: the original lane returns only when a NEW
 // session maps to it (entry replaced per fingerprint; no mid-session un-pin).
-// Entries idle out after 2h (lazy sweep on lookup keeps the map bounded).
-const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+// Entries idle out after 6h from last use (dario port, sitting 83: an active
+// session refreshes the timer every turn; a quiet conversation is reaped well
+// after any provider prompt cache is cold anyway). Sitting 83 also bounds the
+// map: beyond SESSION_MAX entries the oldest-seen decile is evicted (lazy,
+// on lookup) so a long-lived router process can not grow it without limit.
+const SESSION_IDLE_MS = 6 * 60 * 60 * 1000;
+const SESSION_MAX = 2000;
 const sessionAffinity = new Map(); // fingerprint -> { model, lastRealPromptTokens, lastSeenMs }
 function sessionFingerprint(body) {
   let sys = "";
@@ -356,6 +422,11 @@ function sessionFingerprint(body) {
 function stickyLookup(fp) {
   const now = Date.now();
   for (const [k, v] of sessionAffinity) if (now - v.lastSeenMs > SESSION_IDLE_MS) sessionAffinity.delete(k);
+  if (sessionAffinity.size > SESSION_MAX) {
+    const oldest = [...sessionAffinity.entries()].sort((x, y) => x[1].lastSeenMs - y[1].lastSeenMs).slice(0, Math.floor(SESSION_MAX / 10));
+    for (const [k] of oldest) sessionAffinity.delete(k);
+    console.log(`[sticky] map over ${SESSION_MAX}: evicted ${oldest.length} oldest-seen entries`);
+  }
   return sessionAffinity.get(fp) || null;
 }
 function stickyPin(fp, h8, model, how, dial) {
@@ -1271,19 +1342,19 @@ function pipeAnthropicToResponsesSSE(upRes, res, model, reqModel, estInput) { //
 let grokRefreshAt = 0;
 async function serveGrok(model, body, res, tag) {
   let t = tokens();
+  const _freshKey = await grokTokenFresh(false); // P1: proactive native refresh when within the 30min margin
+  if (_freshKey) t = { ...t, grok: _freshKey };
   if (!t.grok) throw new Error("no grok token");
   const ob = anthropicToOpenAI(body);
   ob.model = "grok-4.7";
   if (ob.stream) ob.stream_options = { include_usage: true }; // without it x.ai omits the usage chunk and streamed tokens never reach the day pools (same fix as the litellm lane, PR #3)
   const wantStream = !!ob.stream;
   let r = await postUpstream("api.x.ai", "/v1/chat/completions", { "Authorization": "Bearer " + t.grok, "content-type": "application/json" }, JSON.stringify(ob), DIRECT_LANE_IDLE_MS, (status) => wantStream && status === 200);
-  if ((r.status === 401 || r.status === 403) && !r.stream) { // credential rot: refresh beside-config script (60s exec cooldown), re-read token, retry once
+  if ((r.status === 401 || r.status === 403) && !r.stream) { // credential rot: NATIVE refresh (60s forced cooldown), re-read token, retry once (sitting 83: replaced the execSync grok-refresh.sh hack)
     const now = Date.now();
     if (now - grokRefreshAt > 60000) {
       grokRefreshAt = now;
-      const rs = path.join(path.dirname(CONFIG_PATH), "grok-refresh.sh");
-      try { require("child_process").execSync("bash " + JSON.stringify(rs), { timeout: 45000, stdio: "ignore" }); console.log("[grok] " + r.status + " -> refresh script executed"); }
-      catch (e) { console.log("[grok] refresh script failed: " + errText(e).slice(0, 60)); }
+      try { await grokRefreshNow("forced-" + r.status); } catch {}
     }
     const nt = tokens();
     if (nt.grok && nt.grok !== t.grok) {

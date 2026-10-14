@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Native grok OAuth refresh (pattern ported from askalf/dario, MIT): the engine refreshes the grok subscription token itself via `auth.x.ai/oauth2/token` ~30 minutes before expiry (10-minute checks), single-flight with atomic `auth.json` rotation (the provider rotates the refresh token on every grant), with a 30-minute dead-out and a `KEY-ASK grok-oauth` log/meter event on terminal rejection. The reactive 401/403 path now forces a native refresh instead of shelling out to the legacy `grok-refresh.sh` burn-a-query script, which is retired along with its daily launchd job.
+- Session affinity bounds (dario port): the sticky-lane map now carries at most 2000 fingerprints, evicting the oldest-seen decile on lookup, and idle entries live 6 hours from last use instead of 2.
+- selftest: new shape 5 (grok auth freshness inside the 30-minute margin) and shape 6 (same conversation prefix must land on the same lane: route-tag equality across two turns).
+
 - Economic-strata routing: all subscription lanes form one zero-marginal-cost stratum; among equally-capable candidates the picker prefers the provider pool with the most unused daily capacity. Pay-as-you-go stays the terminal fallback.
 - `orchestrator` pseudo-model: a second dial whose picker is restricted to `auto.orchestratorModels` for long-lived main sessions; `auto` remains the everything dial.
 - Orchestrator primary tier (`auto.orchestratorPrimary`): astra/sol hold the main-session seat whenever any of them can serve; `glm-5.3` remains the backup orchestrator and engages only when no primary can (quota, cooldown, or window). Orchestrator sessions walk only within the class, never to hop-class or pay-as-you-go lanes.
