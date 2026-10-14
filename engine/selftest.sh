@@ -62,6 +62,36 @@ S4B=$(curl -s -o /tmp/belay-st4b.body -w '%{http_code}' -m 20 -X POST "$BASE/v1/
 check "shape4 auto 400" "$S4B" "400"
 check "shape4 auto message" "$(grep -c 'too large for every lane' /tmp/belay-st4b.body)" "1"
 
+# shape 5: grok token freshness (P1 native refresh, sitting 83). The engine
+# refreshes ~30min before expiry every 10min; a present expiry inside the
+# margin means the refresh machinery stopped working.
+G5=$(python3 -c "
+import json, sys, datetime
+try:
+    d = json.load(open('$HOME/.grok/auth.json')); e = d[list(d.keys())[0]]
+    exp = datetime.datetime.fromisoformat(e['expires_at'].replace('Z','+00:00'))
+    margin = datetime.timedelta(minutes=30)
+    print('ok' if exp - datetime.datetime.now(datetime.timezone.utc) > margin else 'stale')
+except FileNotFoundError:
+    print('skip')")
+if [ "$G5" = "skip" ]; then echo "ok   shape5 grok-auth (no auth file, skipped)"; PASS=$((PASS+1))
+else check "shape5 grok-auth fresh" "$G5" "ok"; fi
+
+# shape 6: session-sticky smoke (sitting 83). Same system+first-message prefix
+# must land on the SAME lane twice: the route tag in stream 2 equals stream 1.
+REQ6='{"model":"auto","stream":true,"max_tokens":512,"system":"You are the selftest oracle.","messages":[{"role":"user","content":"sticky probe: reply SELFTEST-6"}]}'
+echo "$REQ6" > /tmp/belay-st6.json
+curl -s -N -m 90 -o /tmp/belay-st6a.sse -X POST "$BASE/v1/messages" -H "authorization: Bearer $KEY" -H 'content-type: application/json' --data-binary @/tmp/belay-st6.json
+python3 -c "import json;b=json.load(open('/tmp/belay-st6.json'));b['messages'].append({'role':'assistant','content':'SELFTEST-6'});b['messages'].append({'role':'user','content':'again, same lane expected'});json.dump(b,open('/tmp/belay-st6b.json','w'))"
+curl -s -N -m 90 -o /tmp/belay-st6b.sse -X POST "$BASE/v1/messages" -H "authorization: Bearer $KEY" -H 'content-type: application/json' --data-binary @/tmp/belay-st6b.json
+# Compare LANE identity only: a cache-warm sticky hit skips decideAuto, so the
+# second turn's tag legitimately omits the difficulty suffix (e.g. ":trivial").
+tag_lane() { grep -o '"thinking_delta","thinking":"· [^"]*"' "$1" | head -1 | sed 's/:[a-z]* ·/ ·/'; }
+TAG6A=$(tag_lane /tmp/belay-st6a.sse)
+TAG6B=$(tag_lane /tmp/belay-st6b.sse)
+if [ -z "$TAG6A" ] || [ -z "$TAG6B" ]; then echo "FAIL shape6 sticky-lane: no route tag found (a=$TAG6A b=$TAG6B)"; FAIL=$((FAIL+1))
+else check "shape6 sticky-lane same-tag" "$TAG6B" "$TAG6A"; fi
+
 echo "-----"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
