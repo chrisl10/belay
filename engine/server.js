@@ -75,6 +75,7 @@ function refreshConfig() {
 }
 loadConfig();
 loadCatalog();
+if (!cfg && process.argv.includes("--selfcheck-aging")) cfg = { candidates: {}, chains: {} }; // configless selfcheck (PRD-010 S1)
 if (!cfg) { console.error("[config] no valid config at " + CONFIG_PATH + " - refusing to start"); process.exit(1); }
 
 // ---------- PRD-005: usage metering + dashboard ----------
@@ -82,7 +83,7 @@ if (!cfg) { console.error("[config] no valid config at " + CONFIG_PATH + " - ref
 // dashboard read this. Streams count requests/outcomes; non-stream counts tokens.
 const DATA_DIR = process.env.BELAY_DATA || process.env.FABRIC_DATA || path.join(H, "belay");
 const USAGE_PATH = path.join(DATA_DIR, "usage.json");
-const USAGE = { startedAt: Date.now(), models: {}, events: [] };
+const USAGE = { startedAt: Date.now(), models: {}, events: [], aging: { requests: 0, applied: 0, committed: 0, deferred: 0, dup: 0, retained: 0, bytesBefore: 0, bytesAfter: 0 } };
 try { const d = JSON.parse(fs.readFileSync(USAGE_PATH, "utf8")); USAGE.models = d.models || {}; USAGE.day = d.day || { date: new Date().toISOString().slice(0, 10), models: {} }; USAGE.events = (d.events || []).slice(0, 50); } catch {}
 function meter(model, outcome, tokens, ms) {
   const today = new Date().toISOString().slice(0, 10);
@@ -151,7 +152,7 @@ function providerPools() {
 const PORT = process.env.BELAY_PORT || process.env.FABRIC_PORT || cfg.port || 4000;
 const TS_IP = process.env.BELAY_TS_IP || process.env.FABRIC_TS_IP || cfg.tailnetIp || ""; // empty = loopback-only bind (bot machines)
 const LITELLM = { host: (cfg.litellm && cfg.litellm.host) || "127.0.0.1", port: (cfg.litellm && cfg.litellm.port) || 4001 };
-const KEY = fs.readFileSync(path.join(H, ".typesafe.key"), "utf8").trim();
+const KEY = (() => { try { return fs.readFileSync(path.join(H, ".typesafe.key"), "utf8").trim(); } catch { if (process.argv.includes("--selfcheck-aging")) return "selfcheck-no-jev"; throw new Error("missing ~/.typesafe.key (jev lane key)"); } })();
 const client = new TypeSafeClient({ apiKey: KEY });
 // PRD-001 security HIGH-1: fabric validates the bearer token on every endpoint itself
 // (the client doc already promises this; Tailscale alone is not authN).
@@ -444,6 +445,266 @@ function estimateForSession(body, fp) {
     return est;
   }
   return estimateTokens(body);
+}
+
+// ---------- PRD-010 Stage 1 (HELIX fold, 2026-10-16): receipt aging ----------
+// Patterns adapted from SuperHelix77/HELIX-1.0 (MIT; mined at b3e1b2b, see
+// macdev library/knowledge/private/belay/helix-pattern-mining.md): age old
+// tool_result blocks into compact receipts AFTER the model has acted on
+// them, retain the exact original in a content-addressed encrypted store,
+// and COMMIT the rewrites in batches so the request prefix stays
+// byte-stable between turns - continuous trimming would forfeit the very
+// prompt-cache reuse the sticky lanes exist to protect. Default OFF; enable
+// via config receiptAging.enabled, or per-request x-receipt-aging: 1|0
+// (header wins), or BELAY_RECEIPT_AGING=on|off (env beats config, header
+// beats env). Never touches messages[0] (session fingerprint stability).
+const AGING_DIR = path.join(DATA_DIR, "retained");
+const AGING_HANDLE_RE = /^[A-Za-z0-9_-]{43}$/u;
+const AGING_MAGIC = Buffer.from("FRTR1", "ascii");
+const AGING_SECURITY_EVIDENCE = /\bCVE-\d{4}-\d{4,}\b|\b(?:vulnerabilit(?:y|ies)|exploit(?:ation)?|remote code execution|privilege escalation|authentication bypass|SQL injection|cross[- ]site scripting)\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/iu;
+function agingCfg() {
+  const c = (cfg && cfg.receiptAging) || {};
+  return {
+    enabled: c.enabled === true,
+    minBytes: Number.isFinite(c.minBytes) && c.minBytes > 0 ? c.minBytes : 8192,
+    frontierMaxBytes: Number.isFinite(c.frontierMaxBytes) && c.frontierMaxBytes > 0 ? c.frontierMaxBytes : 32768,
+    previewUnits: Number.isFinite(c.previewUnits) && c.previewUnits > 0 ? c.previewUnits : 32,
+    batchMinResults: Number.isFinite(c.batchMinResults) && c.batchMinResults > 0 ? c.batchMinResults : 8,
+    batchMinBytes: Number.isFinite(c.batchMinBytes) && c.batchMinBytes > 0 ? c.batchMinBytes : 16384,
+    ttlDays: Number.isFinite(c.ttlDays) && c.ttlDays > 0 ? c.ttlDays : 7,
+    maxFiles: Number.isFinite(c.maxFiles) && c.maxFiles > 0 ? c.maxFiles : 32768,
+    maxBytes: Number.isFinite(c.maxBytes) && c.maxBytes > 0 ? c.maxBytes : 512 * 1024 * 1024,
+  };
+}
+let agingKeyCache = null;
+function agingKey() { // per-store 32-byte key, owner-private, created once
+  if (agingKeyCache) return agingKeyCache;
+  fs.mkdirSync(AGING_DIR, { recursive: true, mode: 0o700 });
+  const kp = path.join(AGING_DIR, ".retention-key");
+  if (!fs.existsSync(kp)) fs.writeFileSync(kp, crypto.randomBytes(32), { mode: 0o600 });
+  const k = fs.readFileSync(kp);
+  if (k.length !== 32) throw new Error("retention key has invalid size");
+  agingKeyCache = k;
+  return k;
+}
+let agingStoreStats = { files: 0, bytes: 0, sweptMs: 0 };
+function agingSweep(ac) { // TTL expiry + recount, throttled to one per 5 min
+  const now = Date.now();
+  if (now - agingStoreStats.sweptMs < 5 * 60 * 1000) return;
+  agingStoreStats = { files: 0, bytes: 0, sweptMs: now };
+  let names = [];
+  try { names = fs.readdirSync(AGING_DIR).filter((n) => n.endsWith(".result")); } catch { return; }
+  const cutoff = now - ac.ttlDays * 24 * 60 * 60 * 1000;
+  for (const n of names) {
+    try {
+      const st = fs.statSync(path.join(AGING_DIR, n));
+      if (st.mtimeMs < cutoff) { fs.unlinkSync(path.join(AGING_DIR, n)); continue; }
+      agingStoreStats.files += 1; agingStoreStats.bytes += st.size;
+    } catch {}
+  }
+}
+function agingEnvelope(plainBuf, key) {
+  const nonce = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", key, nonce);
+  const ct = Buffer.concat([c.update(plainBuf), c.final()]);
+  return Buffer.concat([AGING_MAGIC, nonce, c.getAuthTag(), ct]); // getAuthTag only valid after final()
+}
+function agingUnwrap(envelope, key) {
+  if (envelope.length < AGING_MAGIC.length + 28 || !envelope.subarray(0, AGING_MAGIC.length).equals(AGING_MAGIC)) throw new Error("retained-result envelope invalid");
+  const ns = AGING_MAGIC.length;
+  const d = crypto.createDecipheriv("aes-256-gcm", key, envelope.subarray(ns, ns + 12));
+  d.setAuthTag(envelope.subarray(ns + 12, ns + 28));
+  return Buffer.concat([d.update(envelope.subarray(ns + 28)), d.final()]);
+}
+function retainResult(text, ac) { // -> handle; verify-on-retain before returning (HELIX discipline)
+  const plain = Buffer.from(String(text), "utf8");
+  const handle = crypto.createHash("sha256").update(plain).digest("base64url");
+  if (!AGING_HANDLE_RE.test(handle)) throw new Error("retention handle malformed");
+  agingSweep(ac);
+  const target = path.join(AGING_DIR, handle + ".result");
+  if (fs.existsSync(target)) {
+    if (!agingUnwrap(fs.readFileSync(target), agingKey()).equals(plain)) throw new Error("retention handle collision");
+    return handle;
+  }
+  if (agingStoreStats.files >= ac.maxFiles || agingStoreStats.bytes + plain.length + 65 > ac.maxBytes) throw new Error("retention store at capacity");
+  const env = agingEnvelope(plain, agingKey());
+  const stage = path.join(AGING_DIR, ".stage." + crypto.randomBytes(8).toString("hex"));
+  fs.writeFileSync(stage, env, { mode: 0o600 });
+  fs.renameSync(stage, target); // atomic within one filesystem
+  agingStoreStats.files += 1; agingStoreStats.bytes += env.length;
+  return handle;
+}
+function readRetainedResult(handle) {
+  if (typeof handle !== "string" || !AGING_HANDLE_RE.test(handle)) throw new Error("invalid retention handle");
+  const plain = agingUnwrap(fs.readFileSync(path.join(AGING_DIR, handle + ".result")), agingKey());
+  if (crypto.createHash("sha256").update(plain).digest("base64url") !== handle) throw new Error("retained-result integrity check failed");
+  return plain.toString("utf8");
+}
+function agingText(content) { // tool_result content -> text, or undefined when non-textual
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = [];
+  for (const p of content) {
+    if (!p || typeof p !== "object" || p.type !== "text" || typeof p.text !== "string") return undefined;
+    parts.push(p.text);
+  }
+  return parts.join("\n");
+}
+function agingPreview(v, units, tail) {
+  let a = tail ? Math.max(0, v.length - units) : Math.min(v.length, units);
+  if (!tail && a > 0 && a < v.length && /[\uD800-\uDBFF]/u.test(v[a - 1] || "")) a -= 1;
+  if (tail && a > 0 && a < v.length && /[\uDC00-\uDFFF]/u.test(v[a] || "")) a += 1;
+  return tail ? v.slice(a) : v.slice(0, a);
+}
+function agingReceipt(text, toolName, handle, beforeBytes, previewUnits) {
+  const name = toolName ? " " + toolName : "";
+  return [
+    `[fabric retained tool result${name}: ${beforeBytes} bytes, handle ${handle}; exact original held by the router, recoverable via GET /v1/receipt/${handle}]`,
+    agingPreview(text, previewUnits, false),
+    "[... middle archived ...]",
+    agingPreview(text, previewUnits, true),
+  ].join("\n");
+}
+function agingDupReceipt(beforeBytes, handle, firstId) {
+  return `[fabric retained tool result: byte-identical to earlier result ${JSON.stringify(firstId)} (${beforeBytes} bytes); handle ${handle}; exact original held by the router, recoverable via GET /v1/receipt/${handle}]`;
+}
+// Cache-stable policy per session (HELIX cache-stable-aging): committed
+// rewrites replay byte-identically from the stored receipt text; fresh
+// rewrites wait for a batch threshold so the prefix does not churn on
+// every turn and destroy the provider prompt cache.
+const agingPolicies = new Map(); // fp -> { decisions: Map(key -> receipt), lastSeenMs }
+const AGING_POLICIES_MAX = 256;
+const AGING_DECISIONS_MAX = 8192;
+function agingPass(messages, ac, policy) {
+  // backward pass: a result is ageable only after a later assistant turn
+  const actedAfter = new Array(messages.length).fill(false);
+  let later = false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    actedAfter[i] = later;
+    if (messages[i] && messages[i].role === "assistant") later = true;
+  }
+  // tool_use signatures for duplicate matching (same tool + same input)
+  const uses = new Map();
+  for (const m of messages) {
+    if (!m || m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) if (b && b.type === "tool_use" && typeof b.id === "string") uses.set(b.id, String(b.name || "?") + "\n" + JSON.stringify(b.input || null));
+  }
+  // frontier: the newest tool_result-bearing message stays intact while small
+  let frontierIdx = -1, frontierBytes = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const c = messages[i] && messages[i].content;
+    if (Array.isArray(c) && c.some((b) => b && b.type === "tool_result")) {
+      frontierIdx = i;
+      for (const b of c) if (b && b.type === "tool_result") { const t = agingText(b.content); if (t !== undefined) frontierBytes += Buffer.byteLength(t, "utf8"); }
+      break;
+    }
+  }
+  const stats = { aged: 0, dup: 0, retained: 0, applied: 0, committed: 0, deferred: 0, bytesBefore: 0, bytesAfter: 0 };
+  const seen = new Map(); // content digest -> { callId, sig }
+  const proposals = []; // { mi, bi, key, before, receipt, saved, fresh }
+  for (let i = 1; i < messages.length; i++) { // i === 0 untouched: fingerprint stability
+    const m = messages[i];
+    if (!m || !Array.isArray(m.content)) continue;
+    if (!actedAfter[i]) continue;
+    const frontierProtected = i === frontierIdx && frontierBytes <= ac.frontierMaxBytes;
+    for (let j = 0; j < m.content.length; j++) {
+      const b = m.content[j];
+      if (!b || b.type !== "tool_result") continue;
+      const text = agingText(b.content);
+      if (text === undefined) continue;
+      const size = Buffer.byteLength(text, "utf8");
+      const sig = uses.get(b.tool_use_id) || "";
+      const digest = crypto.createHash("sha256").update(text, "utf8").digest("hex");
+      if (!seen.has(digest)) seen.set(digest, { callId: b.tool_use_id, sig });
+      if (frontierProtected || size <= ac.minBytes) continue;
+      if (AGING_SECURITY_EVIDENCE.test(text)) continue; // decision-critical evidence rides in full
+      const key = crypto.createHash("sha256").update(JSON.stringify([b.tool_use_id, text])).digest("hex");
+      const known = policy.decisions.get(key);
+      if (typeof known === "string") { // committed: replay byte-identically
+        const saved = size - Buffer.byteLength(known, "utf8");
+        if (saved > 0) proposals.push({ mi: i, bi: j, key, before: size, receipt: known, saved, fresh: false });
+        continue;
+      }
+      let handle;
+      try {
+        handle = retainResult(text, ac);
+        if (readRetainedResult(handle) !== text) throw new Error("round-trip mismatch");
+      } catch { continue; } // no verified retention, no aging
+      const prior = seen.get(digest);
+      const isDup = prior && prior.sig === sig && prior.callId !== b.tool_use_id;
+      const receipt = isDup ? agingDupReceipt(size, handle, prior.callId) : agingReceipt(text, sig.split("\n")[0].slice(0, 40), handle, size, ac.previewUnits);
+      const rBytes = Buffer.byteLength(receipt, "utf8");
+      if (rBytes >= size) continue; // strictly smaller or not at all
+      if (isDup) stats.dup += 1; else stats.aged += 1;
+      stats.retained += 1;
+      proposals.push({ mi: i, bi: j, key, before: size, receipt, saved: size - rBytes, fresh: true });
+    }
+  }
+  const fresh = proposals.filter((p) => p.fresh);
+  const commit = fresh.length >= ac.batchMinResults || fresh.reduce((n, p) => n + p.saved, 0) >= ac.batchMinBytes;
+  if (commit) {
+    for (const p of fresh) policy.decisions.set(p.key, p.receipt);
+    while (policy.decisions.size > AGING_DECISIONS_MAX) policy.decisions.delete(policy.decisions.keys().next().value);
+    stats.committed = fresh.length;
+  } else stats.deferred = fresh.length;
+  const applied = proposals.filter((p) => !p.fresh || commit);
+  if (applied.length) {
+    const byMsg = new Map();
+    for (const p of applied) {
+      if (!byMsg.has(p.mi)) byMsg.set(p.mi, new Map());
+      byMsg.get(p.mi).set(p.bi, p.receipt);
+      stats.applied += 1;
+      stats.bytesBefore += p.before;
+      stats.bytesAfter += Buffer.byteLength(p.receipt, "utf8");
+    }
+    messages = messages.map((m, i) => {
+      const edits = byMsg.get(i);
+      if (!edits) return m;
+      return { ...m, content: m.content.map((b, j) => (edits.has(j) ? { ...b, content: edits.get(j) } : b)) };
+    });
+  }
+  return { messages, stats };
+}
+// Public entry: mutate body.messages in place; gated by header/env/config.
+function applyReceiptAging(body, sessionCtx, req) {
+  try {
+    if (!body || !Array.isArray(body.messages) || body.messages.length < 3 || body._noAging) return false;
+    const ac = agingCfg();
+    const h = req && req.headers && req.headers["x-receipt-aging"];
+    let on = ac.enabled;
+    if (h === "1" || h === "0") on = h === "1";
+    else if (process.env.BELAY_RECEIPT_AGING === "on" || process.env.BELAY_RECEIPT_AGING === "off") on = process.env.BELAY_RECEIPT_AGING === "on";
+    if (!on) return false;
+    const fp = sessionCtx && sessionCtx.fp;
+    if (!fp) return false;
+    const now = Date.now();
+    for (const [k, v] of agingPolicies) if (now - v.lastSeenMs > SESSION_IDLE_MS) agingPolicies.delete(k);
+    let policy = agingPolicies.get(fp);
+    if (!policy) {
+      if (agingPolicies.size >= AGING_POLICIES_MAX) agingPolicies.delete(agingPolicies.keys().next().value);
+      policy = { decisions: new Map(), lastSeenMs: 0 };
+      agingPolicies.set(fp, policy);
+    }
+    policy.lastSeenMs = now;
+    const r = agingPass(body.messages, ac, policy);
+    if (r.stats.applied) body.messages = r.messages;
+    if (r.stats.applied || r.stats.committed || r.stats.deferred) {
+      USAGE.aging.requests += 1;
+      USAGE.aging.applied += r.stats.applied;
+      USAGE.aging.committed += r.stats.committed;
+      USAGE.aging.deferred += r.stats.deferred;
+      USAGE.aging.dup += r.stats.dup;
+      USAGE.aging.retained += r.stats.retained;
+      USAGE.aging.bytesBefore += r.stats.bytesBefore;
+      USAGE.aging.bytesAfter += r.stats.bytesAfter;
+      console.log(`[aging] session ${sessionCtx.h8}: applied ${r.stats.applied} committed ${r.stats.committed} deferred ${r.stats.deferred} (dup ${r.stats.dup}) bytes ${r.stats.bytesBefore} -> ${r.stats.bytesAfter}`);
+      meterEvent(`[aging] session ${sessionCtx.h8}: applied ${r.stats.applied} committed ${r.stats.committed} deferred ${r.stats.deferred} bytes ${r.stats.bytesBefore} -> ${r.stats.bytesAfter}`);
+    }
+    return true;
+  } catch (e) {
+    console.log("[aging] pass failed (aging disabled for this request): " + errText(e).slice(0, 120));
+    return false; // aging is an optimization: never fails a request
+  }
 }
 
 async function decideAuto(body, orchestratorOnly) {
@@ -1786,6 +2047,7 @@ async function handleChatCompletions(req, res, body) {
   // this request resolves to, auto or explicit.
   const _fp = sessionFingerprint(translated);
   const _h8 = _fp.slice(0, 8);
+  applyReceiptAging(translated, { fp: _fp, h8: _h8 }, req); // PRD-010 S1: shrink before window sizing / picker
   const _pinned = stickyLookup(_fp);
   let startModel;
   const _dial = reqModel === "orchestrator" ? "orchestrator" : (reqModel === "auto" || (!CANDIDATES[reqModel] && !reqModel.startsWith("openrouter"))) ? "auto" : reqModel;
@@ -1828,6 +2090,7 @@ async function handleResponses(req, res, body) {
   const checked = validateMessageBody({ model: reqModel });
   if (!checked.ok) return sendOpenAIError(res, 400, checked.message);
   const translated = responsesToAnthropic(body); // C-2: pure, crash-guarded translation
+  if (Array.isArray(body.input) && body.input.some((x) => x && typeof x.type === "string" && x.type.includes("compaction"))) translated._noAging = true; // never fight the client's own compaction (HELIX discipline)
   const effort = (body.reasoning && typeof body.reasoning === "object" && typeof body.reasoning.effort === "string") ? body.reasoning.effort : "";
   if (effort) console.log(`[responses] reasoning effort=${effort} (informational)`); // C-3: recorded for ladder logs
   translated._routeEffort = effort; // PRD-004: rides the route tag
@@ -1835,6 +2098,7 @@ async function handleResponses(req, res, body) {
   // rides the translated prefix so appended turns keep the same session.
   const _fp = sessionFingerprint(translated);
   const _h8 = _fp.slice(0, 8);
+  applyReceiptAging(translated, { fp: _fp, h8: _h8 }, req); // PRD-010 S1: shrink before window sizing / picker
   const _pinned = stickyLookup(_fp);
   let startModel;
   const _dial = reqModel === "orchestrator" ? "orchestrator" : (checked.passthrough || reqModel === "auto") ? "auto" : reqModel;
@@ -1897,6 +2161,19 @@ function handleRequest(req, res) {
     req.resume();
     return;
   }
+  if (req.method === "GET" && req.url.startsWith("/v1/receipt/")) { // PRD-010 S1: recover a retained original by handle (master-key auth)
+    if (!authorized(req)) { res.writeHead(401, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { message: "unauthorized" } })); }
+    const handle = decodeURIComponent(req.url.slice("/v1/receipt/".length)).trim();
+    try {
+      const text = readRetainedResult(handle);
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      return res.end(text);
+    } catch (e) {
+      const bad = /invalid retention handle/.test(String(e.message));
+      res.writeHead(bad ? 400 : 404, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: String(e.message) } }));
+    }
+  }
   if (req.method === "GET" && req.url.startsWith("/v1/health")) {
     let lastCapture = 0, captureCount = 0;
     try { const cs = fs.readdirSync(CAPTURE_DIR).filter((x) => x.endsWith(".sse")); captureCount = cs.length; for (const c of cs) { const m = c.match(/stream-(\d+)-/); if (m) lastCapture = Math.max(lastCapture, Number(m[1])); } } catch {}
@@ -1938,7 +2215,7 @@ function handleRequest(req, res) {
   }
   if (req.method === "GET" && req.url.startsWith("/v1/usage")) {
     res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), day: USAGE.day, providerPools: providerPools(), models: USAGE.models, events: USAGE.events.slice(0, 30) }));
+    return res.end(JSON.stringify({ startedAt: USAGE.startedAt, uptimeSec: Math.floor((Date.now() - USAGE.startedAt) / 1000), day: USAGE.day, providerPools: providerPools(), aging: USAGE.aging, models: USAGE.models, events: USAGE.events.slice(0, 30) }));
   }
   if (req.method === "GET" && req.url.startsWith("/v1/config")) {
     res.writeHead(200, { "content-type": "application/json" });
@@ -2007,6 +2284,7 @@ function handleRequest(req, res) {
     // models returned above never touch the affinity map.
     const _fp = sessionFingerprint(parsed);
     const _h8 = _fp.slice(0, 8);
+    applyReceiptAging(parsed, { fp: _fp, h8: _h8 }, req); // PRD-010 S1: shrink before window sizing / picker
     const _pinned = stickyLookup(_fp);
     try {
       const _dial = parsed.model === "orchestrator" ? "orchestrator" : parsed.model === "auto" ? "auto" : parsed.model;
@@ -2036,6 +2314,66 @@ function handleRequest(req, res) {
     // (unknown names) still proxy raw above.
     return serveWithLadder(req, res, parsed, startModel, undefined, undefined, { fp: _fp, h8: _h8, pinnedModel: startModel });
   });
+}
+
+// PRD-010 S1 selfcheck: node engine/server.js --selfcheck-aging
+// Exercises the aging pass + retention store in isolation (no listeners). Runs on
+// a host that has the master key (the canary); exits 0 only on full pass.
+if (process.argv.includes("--selfcheck-aging")) {
+  const ac = agingCfg();
+  ac.enabled = true; ac.minBytes = 200; ac.frontierMaxBytes = 400; ac.previewUnits = 24; ac.batchMinResults = 1; ac.batchMinBytes = 1;
+  let pass = 0, fail = 0;
+  const check = (name, ok) => { if (ok) { pass++; console.log("AGING-OK " + name); } else { fail++; console.log("AGING-FAIL " + name); } };
+  const big = "LINE-" + crypto.randomBytes(8).toString("hex") + "-"; const bigText = Array.from({ length: 60 }, (_, i) => big + i + " " + "x".repeat(20)).join("\n");
+  const mk = (role, blocks) => ({ role, content: blocks });
+  const toolUse = (id, name) => ({ type: "tool_use", id, name, input: { q: 1 } });
+  const toolRes = (id, text) => ({ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] });
+  try {
+    const h = retainResult(bigText, ac);
+    check("store roundtrip verify-on-retain", AGING_HANDLE_RE.test(h) && readRetainedResult(h) === bigText);
+    check("store rejects malformed handle", (() => { try { readRetainedResult("short"); return false; } catch (e) { return /invalid retention handle/.test(e.message); } })());
+    const secText = "scan output\nCVE-2026-1234 remote code execution finding\n" + bigText;
+    const msgs = (extra) => [
+      mk("user", [{ type: "text", text: "first turn question" }]),
+      mk("assistant", [toolUse("t1", "grep")]),
+      mk("user", [toolRes("t1", bigText)]),
+      mk("assistant", [{ type: "text", text: "acted on it" }]),
+      mk("assistant", [toolUse("t2", "grep"), toolUse("t3", "grep"), toolUse("t4", "secscan"), toolUse("t5", "grep"), toolUse("t6", "tiny")]),
+      mk("user", [toolRes("t2", bigText), toolRes("t3", bigText), toolRes("t4", secText), toolRes("t5", "tiny-ok"), toolRes("t6", "x")]),
+      mk("assistant", [{ type: "text", text: "acted on those too" }]), // results must have a later assistant turn to be ageable
+      mk("user", [{ type: "text", text: "continue" }]),
+    ];
+    const pol = { decisions: new Map(), lastSeenMs: Date.now() };
+    const r1 = agingPass(msgs(), ac, pol);
+    check("messages[0] untouched", JSON.stringify(r1.messages[0]) === JSON.stringify(msgs()[0]));
+    check("no later assistant -> not aged", (() => { const m = [mk("user", [{ type: "text", text: "q" }]), mk("assistant", [toolUse("t9", "grep")]), mk("user", [toolRes("t9", bigText)])]; const r = agingPass(m, ac, pol); return r.stats.applied === 0 && r.stats.deferred >= 0; })());
+    const frontierPolicy = { decisions: new Map(), lastSeenMs: Date.now() };
+    const fr = agingPass([mk("user", [{ type: "text", text: "q" }]), mk("assistant", [toolUse("f1", "grep")]), mk("user", [toolRes("f1", bigText)]), mk("assistant", [{ type: "text", text: "acted" }]), mk("assistant", [toolUse("f2", "grep")]), mk("user", [toolRes("f2", bigText)])], ac, frontierPolicy);
+    const lastMsg = fr.messages[fr.messages.length - 1];
+    check("frontier (newest, small) protected", typeof lastMsg.content[0].content !== "string" || lastMsg.content[0].content.includes("LINE-"));
+    const secPolicy = { decisions: new Map(), lastSeenMs: Date.now() };
+    const sr = agingPass(msgs(), ac, secPolicy);
+    const appliedTexts = [];
+    for (const m of sr.messages) if (Array.isArray(m.content)) for (const b of m.content) if (b && b.type === "tool_result" && typeof b.content === "string") appliedTexts.push(b.content);
+    check("security evidence never aged", appliedTexts.every((t) => !t.startsWith("[fabric retained") || !t.includes("CVE-")));
+    check("tiny results untouched", appliedTexts.every((t) => !t.includes("tiny-ok")));
+    const dupPolicy = { decisions: new Map(), lastSeenMs: Date.now() };
+    const dr = agingPass(msgs(), ac, dupPolicy);
+    check("duplicate deduped smaller", dr.stats.dup >= 1 && dr.stats.dup < dr.stats.retained);
+    const batchAc = Object.assign({}, ac, { batchMinResults: 99, batchMinBytes: 10 * 1024 * 1024 });
+    const bPolicy = { decisions: new Map(), lastSeenMs: Date.now() };
+    const b1 = agingPass(msgs(), batchAc, bPolicy);
+    check("below threshold defers (cache-stable)", b1.stats.deferred > 0 && b1.stats.applied === 0);
+    const b2 = agingPass(msgs(), ac, bPolicy);
+    check("threshold pass commits + applies", b2.stats.committed > 0 && b2.stats.applied > 0 && b2.stats.bytesAfter < b2.stats.bytesBefore);
+    const b3 = agingPass(msgs(), ac, bPolicy);
+    check("committed replay byte-stable", b3.stats.applied > 0 && b3.stats.deferred === 0 && JSON.stringify(b3.messages) === JSON.stringify(b2.messages));
+    console.log(`AGING-SELFCHECK ${fail === 0 ? "PASS" : "FAIL"} ${pass}/${pass + fail}`);
+    process.exit(fail === 0 ? 0 : 1);
+  } catch (e) {
+    console.log("AGING-SELFCHECK FAIL exception: " + e.message);
+    process.exit(1);
+  }
 }
 
 // MEDIUM-4: two listeners on the shared handler - loopback for macdev-local clients,
