@@ -92,6 +92,39 @@ TAG6B=$(tag_lane /tmp/belay-st6b.sse)
 if [ -z "$TAG6A" ] || [ -z "$TAG6B" ]; then echo "FAIL shape6 sticky-lane: no route tag found (a=$TAG6A b=$TAG6B)"; FAIL=$((FAIL+1))
 else check "shape6 sticky-lane same-tag" "$TAG6B" "$TAG6A"; fi
 
+# shape 7: PRD-010 S1 internal aging selfcheck (store roundtrip, acted-after
+# invariant, frontier, security evidence, dedup, cache-stable defer/commit/replay).
+S7DIR=$(cd "$(dirname "$0")" && pwd)
+S7=$(cd "$S7DIR" && env -u BELAY_MASTER_KEY node server.js --selfcheck-aging 2>&1 | tail -1) # env -u: BELAY_MASTER_KEY is read as a key-file PATH by the engine; the value would crash the child
+if echo "$S7" | grep -q "AGING-SELFCHECK PASS"; then echo "ok   shape7 aging-selfcheck ${S7#AGING-SELFCHECK }"; PASS=$((PASS+1))
+else echo "FAIL shape7 aging-selfcheck: $S7"; FAIL=$((FAIL+1)); fi
+
+# shape 8: live aging smoke (header-gated). A conversation with one large acted-on
+# tool_result (> batchMinBytes) must commit + apply on the first request: the
+# response stays protocol-clean and /v1/usage shows aging.applied advancing.
+python3 - <<'PYEOF'
+import json
+big = "\n".join("aging-probe line %03d %s" % (i, "x" * 60) for i in range(600))  # ~49KB: above the 32KB frontier cap, so the newest-result frontier does NOT protect it
+req = {
+    "model": "auto", "stream": True, "max_tokens": 512,
+    "system": "You are the selftest oracle.",
+    "messages": [
+        {"role": "user", "content": "aging probe"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t8", "name": "grep", "input": {"q": "aging"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t8", "content": [{"type": "text", "text": big}]}]},
+        {"role": "assistant", "content": "acted on the grep output"},
+        {"role": "user", "content": "reply with the single word AGING-8"},
+    ],
+}
+json.dump(req, open("/tmp/belay-st8.json", "w"))
+PYEOF
+U8A=$(curl -s -m 10 "$BASE/v1/usage" -H "authorization: Bearer $KEY" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('aging',{}).get('applied',0))" 2>/dev/null || echo 0)
+curl -s -N -m 90 -o /tmp/belay-st8.sse -X POST "$BASE/v1/messages" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -H 'x-receipt-aging: 1' --data-binary @/tmp/belay-st8.json
+check "shape8 protocol-clean" "$(audit /tmp/belay-st8.sse)" "0"
+U8B=$(curl -s -m 10 "$BASE/v1/usage" -H "authorization: Bearer $KEY" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('aging',{}).get('applied',0))" 2>/dev/null || echo 0)
+if [ "$U8B" -gt "$U8A" ] 2>/dev/null; then echo "ok   shape8 aging applied ($U8A -> $U8B)"; PASS=$((PASS+1))
+else echo "FAIL shape8 aging applied: usage $U8A -> $U8B"; FAIL=$((FAIL+1)); fi
+
 echo "-----"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
