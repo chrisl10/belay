@@ -95,7 +95,7 @@ else check "shape6 sticky-lane same-tag" "$TAG6B" "$TAG6A"; fi
 # shape 7: PRD-010 S1 internal aging selfcheck (store roundtrip, acted-after
 # invariant, frontier, security evidence, dedup, cache-stable defer/commit/replay).
 S7DIR=$(cd "$(dirname "$0")" && pwd)
-S7=$(cd "$S7DIR" && node server.js --selfcheck-aging 2>&1 | tail -1)
+S7=$(cd "$S7DIR" && env -u BELAY_MASTER_KEY node server.js --selfcheck-aging 2>&1 | tail -1) # env -u: BELAY_MASTER_KEY is read as a key-file PATH by the engine; the value would crash the child
 if echo "$S7" | grep -q "AGING-SELFCHECK PASS"; then echo "ok   shape7 aging-selfcheck ${S7#AGING-SELFCHECK }"; PASS=$((PASS+1))
 else echo "FAIL shape7 aging-selfcheck: $S7"; FAIL=$((FAIL+1)); fi
 
@@ -104,7 +104,7 @@ else echo "FAIL shape7 aging-selfcheck: $S7"; FAIL=$((FAIL+1)); fi
 # response stays protocol-clean and /v1/usage shows aging.applied advancing.
 python3 - <<'PYEOF'
 import json
-big = "\n".join("aging-probe line %03d %s" % (i, "x" * 60) for i in range(300))
+big = "\n".join("aging-probe line %03d %s" % (i, "x" * 60) for i in range(600))  # ~49KB: above the 32KB frontier cap, so the newest-result frontier does NOT protect it
 req = {
     "model": "auto", "stream": True, "max_tokens": 512,
     "system": "You are the selftest oracle.",
